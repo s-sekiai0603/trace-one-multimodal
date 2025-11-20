@@ -1,0 +1,11 @@
+.pytest_cache/
+data/
+evidence/
+gallery/
+new_id_photo/
+old_id_photo/
+docs/
+models/
+videos/
+__pycache__/
+*.pyc
