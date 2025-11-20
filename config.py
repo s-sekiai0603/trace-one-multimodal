@@ -198,7 +198,7 @@ GAIT_MIXER_MODEL_PATH = "models/GaitMixer.pt"
 
 # GaitMixer用 TTA の有効/無効
 TTA_FLIP_ENABLED: bool  = True   # 左右反転TTA（flip_tta_embed）のON/OFF
-TTA_NOISE_ENABLED: bool = False  # ノイズTTA（noise_tta_embed）のON/OFF
+TTA_NOISE_ENABLED: bool = True  # ノイズTTA（noise_tta_embed）のON/OFF
 TTA_TEMPORAL_ENABLED: bool  = True  # 時間反転TTAのON/OFF
 
 # GaitMixer用 左右反転TTA
@@ -222,7 +222,7 @@ NORM_MIN_SCALE: float                    = 1e-6          # スケール下限
 
 # 時系列の安定化（EMA）
 NORM_EWMA_ENABLED: bool                  = True          # 有効/無効
-NORM_EWMA_ALPHA: float                   = 0.85           # 0<α<1（大きいほど最新重視）
+NORM_EWMA_ALPHA: float                   = 0.30           # 0<α<1（大きいほど最新重視）0.85
 NORM_EWMA_APPLY_TO_CENTER: bool          = True          # centerへEMA適用
 NORM_EWMA_APPLY_TO_SCALE: bool           = True          # scaleへEMA適用
 
@@ -233,7 +233,7 @@ FLIP_TTA_L2_NORMALIZE: bool              = False
 
 # --- ノイズTTA ---
 NOISE_TTA_DEFAULT_SIGMA: float           = 0.02        # 正規化座標系の標準偏差
-NOISE_TTA_DEFAULT_SAMPLES: int           = 8             # ノイズサンプル数
+NOISE_TTA_DEFAULT_SAMPLES: int           = 4             # ノイズサンプル数
 NOISE_TTA_INCLUDE_BASE: bool             = True          # 元系列も平均に含める
 NOISE_TTA_L2_NORMALIZE: bool             = False
 
@@ -299,7 +299,7 @@ AUTO_GAIT_YAW_ENABLED = False
 # Auto mode
 AUTO_MODE_NAME = "マルチモーダル"
 AUTO_FACE_FRAMES = 3      # 顔：最初に積むフレーム数
-AUTO_APP_FRAMES  = 32     # 外見：最初に積むフレーム数
+AUTO_APP_FRAMES  = 5     # 外見：最初に積むフレーム数
 AUTO_GAIT_FRAMES = 32     # 歩容：最初に積むフレーム数
 
 # === AUTO (顔+外見+歩容) 共通保存先 / 連番仕様 ===

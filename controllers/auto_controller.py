@@ -215,6 +215,8 @@ class AutoController(QObject):
         
         self._gseq_buffer = deque(maxlen=32)    # 上限は config(AUTO_GAIT_N_FRAMES) に合わせてもOK
         
+        self._gait_tracks: dict[int, deque] = {}
+        
         self._tracker: Optional[ByteTracker] = None
         self._track_ids_pose: Optional[np.ndarray] = None  # Pose BBOXごとの track_id
         self._track_ids_face: Optional[np.ndarray] = None  # Face BBOX ごとの track_id
@@ -1211,35 +1213,54 @@ class AutoController(QObject):
                 if self._gait_api is None:
                     self._resolve_gait_api()
 
-                if self._gait_api is not None and len(self._gseq_buffer) >= 32:
-                    # フレームごとの人数が違うことがあるので、最小人数分だけ評価
-                    try:
-                        min_n = min(len(k) for k in self._gseq_buffer)
-                    except Exception:
-                        min_n = 0
+                if self._gait_api is not None:
+                    # 現フレームの kpts_pose / track_ids_pose から
+                    # track_id -> キーポイント列 を更新
+                    self._update_gait_tracks()
 
-                    gait_sims = None
-                    if min_n > 0:
-                        gait_sims = np.full(min_n, np.nan, dtype=np.float32)
+                    track_ids_pose = getattr(self, "_track_ids_pose", None)
+                    if track_ids_pose is None or len(track_ids_pose) == 0:
+                        # Pose BBOX がなければ歩容は何もしない
+                        pass
+                    else:
+                        n_pose = len(track_ids_pose)
+                        gait_sims = np.full(n_pose, np.nan, dtype=np.float32)
 
-                    best, best_j = None, None
+                        best, best_j = None, None
 
-                    # ギャラリー側：view 別（front/back/side）＋デフォルト（viewなし）
-                    gallery_view_map = getattr(self, "_gallery_gait_by_view", {}) or {}
-                    # 上で _centroid() した g_gait を「ビューなしのデフォルト」として使う
-                    gallery_default  = g_gait
+                        # ギャラリー側：view 別（front/back/side）＋デフォルト（viewなし）
+                        gallery_view_map = getattr(self, "_gallery_gait_by_view", {}) or {}
+                        # 上で _centroid() した g_gait を「ビューなしのデフォルト」として使う
+                        gallery_default  = g_gait
 
-                    for j in range(min_n):
-                        try:
-                            # j番目の人物について、直近Tフレームぶんの骨格列を取り出す
-                            seq = np.stack([kpts[j] for kpts in self._gseq_buffer], axis=0)  # (T,17,3)
-                            gv  = self._gait_embed_from_seq(seq)
+                        for j in range(n_pose):
+                            try:
+                                tid = int(track_ids_pose[j])
+                            except Exception:
+                                continue
+                            if tid < 0:
+                                # トラックが付いていない Pose はスキップ
+                                continue
+
+                            # この track_id の歩容シーケンスを取得
+                            dq = getattr(self, "_gait_tracks", {}).get(tid)
+                            if not dq or len(dq) < int(AUTO_GAIT_FRAMES):
+                                # まだ十分フレームがたまっていない
+                                continue
+
+                            # deque[(17,3)] → (T,17,3)
+                            try:
+                                seq = np.stack(list(dq), axis=0).astype(np.float32)
+                            except Exception:
+                                continue
+
+                            gv = self._gait_embed_from_seq(seq)
                             if gv is None:
                                 continue
                             gv = np.asarray(gv, np.float32).reshape(-1)
                             gv /= (np.linalg.norm(gv) + 1e-12)
 
-                            # --- この人物の「必要な向き」を決める ---
+                            # --- この人物の「必要な向き」を決める（Poseインデックス j ベース） ---
                             need_view = None
                             if getattr(self, "_pose_yaws", None) is not None:
                                 if 0 <= j < len(self._pose_yaws):
@@ -1260,23 +1281,20 @@ class AutoController(QObject):
                                 continue
 
                             s = float(np.dot(gv, gvec))
-
-                            if gait_sims is not None:
-                                gait_sims[j] = s
+                            gait_sims[j] = s
 
                             if best is None or s > best:
                                 best, best_j = s, j
-                        except Exception:
-                            continue
 
-                    if gait_sims is not None:
-                        # 0〜min_n-1 が self._boxes_pose の先頭 min_n に対応
-                        self._sim_gait = gait_sims
+                        # 有効な値が1つでもあれば保存（全部 NaN なら捨てる）
+                        if np.any(~np.isnan(gait_sims)):
+                            # インデックスは「Pose BBOX のインデックス」に揃う
+                            self._sim_gait = gait_sims
 
-                    if best_j is not None:
-                        self._hi_gait_idx = int(best_j)
-                        self.log.info("[AUTO][SIM][gait]=%.4f (idx=%d)", best, best_j)
-                        any_hit = True
+                        if best_j is not None:
+                            self._hi_gait_idx = int(best_j)
+                            self.log.info("[AUTO][SIM][gait]=%.4f (idx=%d)", best, best_j)
+                            any_hit = True
         except Exception:
             pass
 
@@ -3196,3 +3214,80 @@ class AutoController(QObject):
             "[AUTO][THRESH] face=%.5f app=%.5f gait=%.5sf",
             self._face_thresh, self._app_thresh, self._gait_thresh
         )
+        
+    def _update_gait_tracks(self) -> None:
+        """
+        現フレームの pose キーポイントと track_id から、
+        track_id ごとの歩容シーケンス deque を更新する。
+
+        - self._kpts_pose : List[np.ndarray] or np.ndarray, shape (Np, 17, 3)
+        - self._track_ids_pose : List[int] or np.ndarray, shape (Np,)
+        """
+        # 属性がまだ無ければ初期化
+        if not hasattr(self, "_gait_tracks"):
+            self._gait_tracks = {}
+
+        kpts_list = getattr(self, "_kpts_pose", None)
+        track_ids = getattr(self, "_track_ids_pose", None)
+
+        if kpts_list is None or track_ids is None:
+            return
+
+        # numpy / list 両対応のため enumerate で回す
+        for pose_idx, tid in enumerate(track_ids):
+            if tid is None or tid < 0:
+                # 無効 track_id は無視
+                continue
+
+            # deque がなければ作る
+            dq = self._gait_tracks.get(tid)
+            if dq is None:
+                dq = deque(maxlen=AUTO_GAIT_FRAMES)
+                self._gait_tracks[tid] = dq
+
+            # 対応するキーポイントを追加
+            try:
+                kpts = kpts_list[pose_idx]
+            except Exception:
+                continue
+            if kpts is None:
+                continue
+
+            dq.append(kpts)
+            
+    def _build_gait_queries_from_tracks(self) -> tuple[list[int], list[np.ndarray]]:
+        """
+        track_id ごとに、AUTO_GAIT_FRAMES 以上たまっているものだけ
+        (T,17,3) シーケンスを作り、GaitMixer に入れる準備をする。
+
+        戻り値:
+            track_ids : List[int]       # クエリ順の track_id
+            seq_list  : List[np.ndarray]  # 各 (T,17,3) シーケンス
+        """
+        track_ids_pose = getattr(self, "_track_ids_pose", None)
+        if track_ids_pose is None:
+            return [], []
+
+        if not hasattr(self, "_gait_tracks") or not self._gait_tracks:
+            return [], []
+
+        out_track_ids: list[int] = []
+        seq_list: list[np.ndarray] = []
+
+        # 「今フレームで生きている track_id だけ」を対象にする
+        for tid in track_ids_pose:
+            if tid is None or tid < 0:
+                continue
+            dq = self._gait_tracks.get(tid)
+            if dq is None:
+                continue
+            if len(dq) < AUTO_GAIT_FRAMES:
+                # まだ T フレームたまっていない
+                continue
+
+            # deque[(17,3)] → (T,17,3)
+            seq = np.stack(list(dq), axis=0)
+            out_track_ids.append(int(tid))
+            seq_list.append(seq)
+
+        return out_track_ids, seq_list
