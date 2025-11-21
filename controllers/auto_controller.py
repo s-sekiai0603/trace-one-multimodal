@@ -44,7 +44,7 @@ try:
         # 各埋め込み器
         ADAFACE_CKPT_PATH, ADAFACE_ARCH, ADAFACE_MARGIN, ADAFACE_OUT_SIZE, ADAFACE_LOG_EVERY,
         # Auto用パラメータ
-        AUTO_MODE_NAME, AUTO_FACE_FRAMES, AUTO_APP_FRAMES, AUTO_GAIT_FRAMES,
+        AUTO_MODE_NAME, AUTO_FACE_FRAMES, AUTO_APP_FRAMES, WINDOW_T,
         AUTO_GALLERY_DIR,
         # 骨格
         POSE_DRAW_LANDMARK_BGR, POSE_DRAW_CONNECTION_BGR, POSE_DRAW_THICKNESS, POSE_DRAW_RADIUS, POSE_KPT_CONF_MIN,
@@ -54,16 +54,17 @@ try:
         AUTO_GAIT_YAW_ENABLED,
         # ギャラリー
         AUTO_GALLERY_DIR, AUTO_FACE_JSON, AUTO_APP_JSON, AUTO_GAIT_JSON,
-        AUTO_SERIAL_PREFIX, AUTO_SERIAL_WIDTH,
+        AUTO_SERIAL_PREFIX, AUTO_SERIAL_WIDTH, AUTO_GAIT_DIR8_WINDOW,
         # ランキングデフォルト閾値
         AUTO_FACE_THRESH_DEFAULT, AUTO_APP_THRESH_DEFAULT, AUTO_GAIT_THRESH_DEFAULT,
+        AUTO_FACE_PRI_THRESH_DEFAULT, AUTO_APP_PRI_THRESH_DEFAULT, AUTO_GAIT_PRI_THRESH_DEFAULT,
         # トラッカー
         BYTE_TRACK_ENABLED,
         BYTE_TRACK_TRACK_THRESH, BYTE_TRACK_HIGH_THRESH,
         BYTE_TRACK_MATCH_THRESH, BYTE_TRACK_MAX_AGE,
         # ランキング
         AUTO_TRACK_RANK_INTERVAL_FRAMES, AUTO_TRACK_RANK_TOPN,
-        AUTO_RANK_MODE,AUTO_REPORT_DIR, AUTO_REPORT_SHOW_SIM,       
+        AUTO_RANK_MODE,AUTO_REPORT_DIR, AUTO_REPORT_SHOW_SIM, AUTO_RANK_GROUP_ORDER       
     )
 except Exception:
     # フォールバック（最低限）
@@ -79,8 +80,8 @@ except Exception:
     ADAFACE_ARCH = "ir_101"; ADAFACE_MARGIN = 0.2; ADAFACE_OUT_SIZE = 512; ADAFACE_LOG_EVERY = 0
     AUTO_MODE_NAME = "マルチモーダル"
     AUTO_FACE_FRAMES = 3
-    AUTO_APP_FRAMES = 32
-    AUTO_GAIT_FRAMES = 32
+    AUTO_APP_FRAMES = 8
+    WINDOW_T = 32
     AUTO_GALLERY_DIR = "data/gallery/auto"
 
 # ==== 依存 ====
@@ -130,10 +131,14 @@ class AutoController(QObject):
         self._auto_report_frame_counter: int = 0
         self._auto_report_session_dir: Optional[str] = None
         
-        # ランキング用しきい値
+        # ランキング用切り捨て閾値
         self._face_thresh: float = float(AUTO_FACE_THRESH_DEFAULT)
         self._app_thresh:  float = float(AUTO_APP_THRESH_DEFAULT)
         self._gait_thresh: float = float(AUTO_GAIT_THRESH_DEFAULT)
+        # ランキング用優先閾値
+        self._face_pri_thresh: float = float(AUTO_FACE_PRI_THRESH_DEFAULT)
+        self._app_pri_thresh: float = float(AUTO_APP_PRI_THRESH_DEFAULT)
+        self._gait_pri_thresh: float = float(AUTO_GAIT_PRI_THRESH_DEFAULT)
 
         # 検出器
         self.face_det: Optional[YOLOFaceDetector] = None
@@ -155,6 +160,11 @@ class AutoController(QObject):
         self._buf_gait_front: List[np.ndarray] = []
         self._buf_gait_back:  List[np.ndarray] = []
         self._buf_gait_side:  List[np.ndarray] = []
+        
+        # 歩容: 8方向(dir8)別に特徴を貯めるバッファ
+        self._buf_gait_dir8: Dict[str, List[np.ndarray]] = {}
+        # 学習中シーケンスの「最後の3フレーム」の dir8 ラベル
+        self._gait_dir8_last3: List[str] = []
         
         # MediaPipe で推定した向き情報
         self._yaw_pose: Optional[np.ndarray] = None         # (N,) yaw[deg], 取れないところは NaN
@@ -507,6 +517,8 @@ class AutoController(QObject):
             self.sel_face_idx = self.sel_pose_idx = None
             self._buf_face.clear(); self._buf_app.clear(); self._buf_gait.clear()
             self._buf_gait_front.clear(); self._buf_gait_back.clear(); self._buf_gait_side.clear()
+            self._buf_gait_dir8.clear()
+            self._gait_dir8_last3.clear()
             self._buf_face_by_pose.clear()
             self._face_pose_run_type = None
             self._face_pose_run_vecs = []
@@ -816,6 +828,23 @@ class AutoController(QObject):
 
             # 歩容: 向き別バッファがあれば view ごとに保存、無ければ従来通り
             gait_path = os.path.join(AUTO_GALLERY_DIR, "gait_gallery.json")
+            
+            buf_dir8 = getattr(self, "_buf_gait_dir8", {}) or {}
+            
+            if buf_dir8:
+                # dir8 ごとに平均して保存
+                for dir8, vecs in buf_dir8.items():
+                    if not vecs:
+                        continue
+                    vec_mean = self._mean(vecs)
+                    self._append_gait_view_json(gait_path, label, dir8, vec_mean)
+
+                self.log.info(
+                    "[AUTO][SAVE] 保存完了: %s (face/app/gait-dir8, face_vecs=%d, dir8=%s)",
+                    label,
+                    len(self._buf_face),
+                    ",".join(sorted(buf_dir8.keys())),
+                )
 
             if AUTO_GAIT_YAW_ENABLED:
                 # 安全のため getattr で取得（まだ属性がなければ空リスト扱い）
@@ -958,25 +987,33 @@ class AutoController(QObject):
             if k is not None:
                 if not hasattr(self, "_gait_seq"):
                     from collections import deque
-                    self._gait_seq = deque(maxlen=int(AUTO_GAIT_FRAMES))
-                self._gait_seq.append(np.asarray(k, np.float32))  # (17,3)
+                    self._gait_seq = deque(maxlen=int(WINDOW_T))
 
-                # 事前にAPI解決（未解決なら一度だけログ）
+                # --- 最新フレームを追加 ---
+                self._gait_seq.append(np.asarray(k, np.float32))  # (17,3)
+                seq_len = len(self._gait_seq)
+
+                # --- ★ 30〜32フレームだけ 8方向ログ ---
+                self._maybe_log_gait_dir8_learning(k, seq_len)
+
+                # --- gait api 初期化 ---
                 if self._gait_api is None:
                     self._resolve_gait_api()
 
-                # 32フレームそろっていて、まだ歩容バッファが空のときだけ 1 本学習
-                if len(self._gait_seq) == int(AUTO_GAIT_FRAMES) and len(self._buf_gait) == 0:
-                    seq = np.stack(list(self._gait_seq), axis=0)  # (T,17,3)
-                    gv = self._gait_embed_from_seq(seq)          # (D,) or None
+                # --- 32フレーム貯まったら特徴学習 ---
+                if seq_len == int(WINDOW_T) and len(self._buf_gait) == 0:
+
+                    seq = np.stack(list(self._gait_seq), axis=0)
+                    gv = self._gait_embed_from_seq(seq)
+
                     if gv is not None:
                         gv = np.asarray(gv, np.float32).reshape(-1)
 
-                        # ① 従来どおり全体バッファにも入れる（既存保存ロジックとの互換性確保）
+                        # 全体バッファに保存
                         self._buf_gait.append(gv)
-                        
+
+                        # 向き別バッファ（MediaPipe Yaw）
                         if AUTO_GAIT_YAW_ENABLED:
-                            # ② MediaPipe の yaw から front/back/side を決定し、向き別バッファにも格納
                             yaw = None
                             yaw_list = getattr(self, "_pose_yaws", None)
                             if yaw_list is not None and self.sel_pose_idx is not None:
@@ -984,14 +1021,10 @@ class AutoController(QObject):
                                 if 0 <= idx < len(yaw_list):
                                     yaw = yaw_list[idx]
 
-                            # デフォルトは front 扱い
+                            # yaw → front/back/side
                             view = "front"
                             if yaw is not None:
                                 a = abs(float(yaw))
-                                # ざっくり:
-                                #   0°±45° → front
-                                #   180°±45° → back
-                                #   それ以外 → side（90°近辺）
                                 if a <= 45.0:
                                     view = "front"
                                 elif a >= 135.0:
@@ -1008,14 +1041,16 @@ class AutoController(QObject):
 
                             self.log.info(
                                 "[AUTO][GAIT] learned 1 seq (T=%d, view=%s, yaw=%s)",
-                                len(self._gait_seq),
+                                seq_len,
                                 view,
                                 f"{yaw:.1f}" if yaw is not None else "None"
                             )
 
-                    # 1本学習したら、このセッション用のシーケンスはリセット
+                    # --- シーケンスを初期化 ---
                     if hasattr(self, "_gait_seq"):
                         self._gait_seq.clear()
+                    if hasattr(self, "_gait_dir8_last3"):
+                        self._gait_dir8_last3.clear()
 
     def _do_identification_and_log(self, frame: np.ndarray):
         # ラベルが指定されていなければ読み込まない
@@ -1070,7 +1105,7 @@ class AutoController(QObject):
         gait_sims: List[float] = []
         if self.gait_embed is not None and self._gallery_gait is not None:
             # クリック選択者のみ評価（全員分の時系列を管理していないため簡易）
-            if len(self._buf_gait) >= int(AUTO_GAIT_FRAMES):
+            if len(self._buf_gait) >= int(WINDOW_T):
                 gv = self._mean(self._buf_gait)  # ここでは平均で近似。実装に合わせて時系列→128Dを算出してください
                 gait_sims = [float(np.dot(gv, self._gallery_gait))]
 
@@ -1215,7 +1250,7 @@ class AutoController(QObject):
 
                 if self._gait_api is not None:
                     # 現フレームの kpts_pose / track_ids_pose から
-                    # track_id -> キーポイント列 を更新
+                    # track_id -> キーポイント列 を更新（既存処理＋dir8更新）
                     self._update_gait_tracks()
 
                     track_ids_pose = getattr(self, "_track_ids_pose", None)
@@ -1228,10 +1263,14 @@ class AutoController(QObject):
 
                         best, best_j = None, None
 
-                        # ギャラリー側：view 別（front/back/side）＋デフォルト（viewなし）
+                        # ギャラリー側：
+                        #  - view/dir8 別マップ（中身は front/back/side でも front-right でもOK）
+                        #  - デフォルト（ビューなしのセントロイド）
                         gallery_view_map = getattr(self, "_gallery_gait_by_view", {}) or {}
-                        # 上で _centroid() した g_gait を「ビューなしのデフォルト」として使う
                         gallery_default  = g_gait
+
+                        # track_id -> 現在のdir8（_update_gait_tracks で更新済み）
+                        dir8_current = getattr(self, "_gait_dir8_current", None)
 
                         for j in range(n_pose):
                             try:
@@ -1244,7 +1283,7 @@ class AutoController(QObject):
 
                             # この track_id の歩容シーケンスを取得
                             dq = getattr(self, "_gait_tracks", {}).get(tid)
-                            if not dq or len(dq) < int(AUTO_GAIT_FRAMES):
+                            if not dq or len(dq) < int(WINDOW_T):
                                 # まだ十分フレームがたまっていない
                                 continue
 
@@ -1260,22 +1299,42 @@ class AutoController(QObject):
                             gv = np.asarray(gv, np.float32).reshape(-1)
                             gv /= (np.linalg.norm(gv) + 1e-12)
 
-                            # --- この人物の「必要な向き」を決める（Poseインデックス j ベース） ---
-                            need_view = None
-                            if getattr(self, "_pose_yaws", None) is not None:
-                                if 0 <= j < len(self._pose_yaws):
-                                    yaw = self._pose_yaws[j]
-                                    if yaw is not None:
-                                        need_view = self._yaw_to_view(yaw)  # "front"/"back"/"side"
+                            gvec = None
+                            used_dir8 = None
+                            used_view = None
 
-                            # --- 向きに応じて、ギャラリー中から優先度順に view を選ぶ ---
-                            gvec = self._pick_gallery_vec_for_view(
-                                need_view,
-                                gallery_view_map,
-                                gallery_default,
-                            )
+                            # --- ① dir8（8方向）を優先してギャラリーを選ぶ ---
+                            if dir8_current and tid in dir8_current:
+                                need_dir8 = dir8_current.get(tid)
+                                if need_dir8:
+                                    used_dir8 = str(need_dir8)
+                                    # 中身は front/back/side でも front-right 等でもOK
+                                    # _pick_gallery_vec_for_dir8 は dir8_map に何が入っていても動く
+                                    gvec = self._pick_gallery_vec_for_dir8(
+                                        need_dir8=used_dir8,
+                                        dir8_map=gallery_view_map,
+                                        default_vec=gallery_default,
+                                    )
+
+                            # --- ② dir8 でギャラリーが取れなかった場合、従来どおり yaw→view にフォールバック ---
+                            if gvec is None:
+                                need_view = None
+                                if AUTO_GAIT_YAW_ENABLED and getattr(self, "_pose_yaws", None) is not None:
+                                    if 0 <= j < len(self._pose_yaws):
+                                        yaw = self._pose_yaws[j]
+                                        if yaw is not None:
+                                            need_view = self._yaw_to_view(yaw)  # "front"/"back"/"side"
+                                            used_view = need_view
+
+                                gvec = self._pick_gallery_vec_for_view(
+                                    need_view,
+                                    gallery_view_map,
+                                    gallery_default,
+                                )
+
                             if gvec is None:
                                 continue
+
                             gvec = np.asarray(gvec, np.float32).reshape(-1)
                             if gvec.shape != gv.shape:
                                 continue
@@ -1293,7 +1352,22 @@ class AutoController(QObject):
 
                         if best_j is not None:
                             self._hi_gait_idx = int(best_j)
-                            self.log.info("[AUTO][SIM][gait]=%.4f (idx=%d)", best, best_j)
+
+                            # ログには、可能なら dir8 を載せる（無ければ None）
+                            best_dir8 = None
+                            if dir8_current and 0 <= best_j < len(track_ids_pose):
+                                try:
+                                    best_tid = int(track_ids_pose[best_j])
+                                    best_dir8 = dir8_current.get(best_tid)
+                                except Exception:
+                                    best_dir8 = None
+
+                            self.log.info(
+                                "[AUTO][SIM][gait]=%.4f (idx=%d, dir8=%s)",
+                                best,
+                                best_j,
+                                best_dir8,
+                            )
                             any_hit = True
         except Exception:
             pass
@@ -1882,24 +1956,25 @@ class AutoController(QObject):
         """
         マルチモーダルモードの歩容ギャラリー用:
         - label_to_vecs は従来通り更新
-        - 追加で records に {label, view, vec} を追記
+        - 追加で records に {label, dir8, vec} を追記
         """
         if vec is None:
             return
 
         # 既存データ読み込み
-        data = {}
-        if os.path.isfile(path):
-            try:
+        try:
+            if os.path.isfile(path):
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except Exception:
+            else:
                 data = {}
+        except Exception:
+            data = {}
 
         label = str(label or "").strip()
         view  = str(view  or "").strip()
         if not label or not view:
-            # ラベル or view が空なら何もしない
+            # ラベル or dir8 が空なら何もしない
             return
 
         # ベクトルを Python の list に
@@ -1914,7 +1989,7 @@ class AutoController(QObject):
             data["label_to_vecs"] = lab2
         lab2.setdefault(label, []).append(v)
 
-        # --- 新形式: records 配列に view 付きで追記 ---
+        # --- 新形式: records 配列に dir8 付きで追記 ---
         recs = data.setdefault("records", [])
         if not isinstance(recs, list):
             recs = []
@@ -1922,7 +1997,7 @@ class AutoController(QObject):
 
         recs.append({
             "label": label,
-            "view":  view,
+            "dir8":  view,  # ← ここが「view」→「dir8」に変更されたポイント
             "vec":   v,
         })
 
@@ -1933,7 +2008,7 @@ class AutoController(QObject):
             json.dump(data, f, ensure_ascii=False, indent=2)
 
         self.log.info(
-            "[AUTO][SAVE][GAIT] wrote: label=%s view=%s dim=%d -> %s",
+            "[AUTO][SAVE][GAIT] wrote: label=%s dir8=%s dim=%d -> %s",
             label, view, len(v), path,
         )
 
@@ -2043,6 +2118,7 @@ class AutoController(QObject):
         self._sel_pose_prev = None
         self._buf_face.clear(); self._buf_app.clear(); self._buf_gait.clear()
         self._buf_face_by_pose.clear()
+        self._gait_dir8_current.clear()
         self._face_pose_run_type = None
         self._face_pose_run_vecs = []
         if not light:
@@ -2650,6 +2726,36 @@ class AutoController(QObject):
             scored_face = scored_face[:maxN]
             scored_app  = scored_app[:maxN]
             scored_gait = scored_gait[:maxN]
+            
+                # 優先（ハイ）閾値による hi / lo 分割
+        def _split_hi_lo(
+            scored_list: list[tuple[int, float]],
+            pri: Optional[float],
+        ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+            """
+            scored_list を優先閾値で hi / lo に分割する。
+            pri が None の場合は、全て lo に入れる。
+            """
+            if not scored_list:
+                return [], []
+            if pri is None:
+                # 優先閾値が無効なら全部 low
+                return [], list(scored_list)
+
+            hi: list[tuple[int, float]] = []
+            lo: list[tuple[int, float]] = []
+            p = float(pri)
+            for idx, v in scored_list:
+                if v >= p:
+                    hi.append((idx, v))
+                else:
+                    lo.append((idx, v))
+            return hi, lo
+
+        face_hi, face_lo = _split_hi_lo(scored_face, self._face_pri_thresh)
+        app_hi,  app_lo  = _split_hi_lo(scored_app,  self._app_pri_thresh)
+        gait_hi, gait_lo = _split_hi_lo(scored_gait, self._gait_pri_thresh)
+
 
         # TrackID（または index）ごとに重複を除外するためのキー
         used_track_keys: set[int] = set()
@@ -2676,28 +2782,59 @@ class AutoController(QObject):
                 gait_sim=g,
             )
 
-        # 顔ブロック → 外見ブロック → 歩容ブロック の順で entries を構成。
-        # すでに entries に入っている TrackID はスキップ（重複削除）。
-        for idx, _ in scored_face:
-            key = _track_key_for_index(idx)
-            if key in used_track_keys:
-                continue
-            used_track_keys.add(key)
-            entries.append(_make_entry(idx, "face"))
+        used_track_keys: set[int] = set()
 
-        for idx, _ in scored_app:
-            key = _track_key_for_index(idx)
-            if key in used_track_keys:
-                continue
-            used_track_keys.add(key)
-            entries.append(_make_entry(idx, "app"))
+        def _track_key_for_index(idx: int) -> int:
+            if self._track_ids_pose is None:
+                return idx
+            try:
+                tid = int(self._track_ids_pose[idx])
+            except Exception:
+                return idx
+            return tid if tid >= 0 else idx
 
-        for idx, _ in scored_gait:
-            key = _track_key_for_index(idx)
-            if key in used_track_keys:
+        def _make_entry(idx: int, used_modality: str) -> RankEntry:
+            f = _valid(sim_face_avg[idx])
+            a = _valid(sim_app_avg[idx])
+            g = _valid(sim_gait_avg[idx])
+            return RankEntry(
+                index=idx,
+                rank=0,  # このあとブロック順に 1,2,3... を振る
+                used_modality=used_modality,
+                face_sim=f,
+                app_sim=a,
+                gait_sim=g,
+            )
+
+        # グループ名 → (スコアリスト, モダリティ名) の対応
+        group_map: dict[str, tuple[list[tuple[int, float]], str]] = {
+            "face_hi": (face_hi, "face"),
+            "face_lo": (face_lo, "face"),
+            "app_hi":  (app_hi,  "app"),
+            "app_lo":  (app_lo,  "app"),
+            "gait_hi": (gait_hi, "gait"),
+            "gait_lo": (gait_lo, "gait"),
+        }
+
+        # コンフィグされたグループ優先順に従って entries を構成。
+        # 不正なキーはスキップする。
+        group_order = AUTO_RANK_GROUP_ORDER or [
+            "face_hi", "face_lo",
+            "app_hi",  "app_lo",
+            "gait_hi", "gait_lo",
+        ]
+
+        for gname in group_order:
+            pair = group_map.get(gname)
+            if not pair:
                 continue
-            used_track_keys.add(key)
-            entries.append(_make_entry(idx, "gait"))
+            scored_list, modality_label = pair
+            for idx, _ in scored_list:
+                key = _track_key_for_index(idx)
+                if key in used_track_keys:
+                    continue
+                used_track_keys.add(key)
+                entries.append(_make_entry(idx, modality_label))
 
         if not entries:
             return
@@ -2844,6 +2981,8 @@ class AutoController(QObject):
             try:
                 if hasattr(self, "_gait_seq"):
                     self._gait_seq.clear()
+                if hasattr(self, "_gait_dir8_last3"):
+                    self._gait_dir8_last3.clear()
             except Exception:
                 pass
 
@@ -3153,6 +3292,157 @@ class AutoController(QObject):
 
         return default_vec
     
+    def _pick_gallery_vec_for_dir8(
+        self,
+        need_dir8: Optional[str],
+        dir8_map: Dict[str, np.ndarray],
+        default_vec: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        """
+        歩容の8方向(dir8)に応じて、ギャラリーから使うベクトルを選ぶ。
+
+        優先順位:
+          1. dir8_map に need_dir8 があればそれ
+          2. なければ「need_dir8ごとの優先順」に従って他のdir8を探す
+          3. それでも無ければ default_vec（非dir8ギャラリー）にフォールバック
+
+        ※ 全方位平均（全dir8の平均）は出さない。
+        """
+
+        if not dir8_map:
+            # dir8 付きギャラリーがそもそも無い → 旧形式のギャラリーへ
+            return default_vec
+
+        # キーを小文字に揃えておく
+        norm_map: Dict[str, np.ndarray] = {}
+        for k, v in dir8_map.items():
+            if v is None:
+                continue
+            k_norm = str(k).strip().lower()
+            norm_map[k_norm] = np.asarray(v, np.float32).reshape(-1)
+
+        if not norm_map:
+            return default_vec
+
+        need = str(need_dir8 or "").strip().lower()
+
+        # まずは完全一致
+        if need and need in norm_map:
+            return norm_map[need]
+
+        # ---- need_dir8 ごとのフォールバック優先順 ----
+        # ラベル対応:
+        #  front        : 正面
+        #  back         : 背面
+        #  front-right  : 右前斜め
+        #  front-left   : 左前斜め
+        #  back-right   : 右後ろ斜め
+        #  back-left    : 左後ろ斜め
+        #  right        : 右側面
+        #  left         : 左側面
+        fallback_rules: Dict[str, list[str]] = {
+            # 右前斜めがない場合
+            #   後ろ左斜め>左前斜め>後ろ右斜め>右側面>左側面>正面>背面
+            "front-right": [
+                "back-left",
+                "front-left",
+                "back-right",
+                "right",
+                "left",
+                "front",
+                "back",
+            ],
+            # 左前斜めがない場合
+            #   後ろ右斜め>右前斜め>後ろ左斜め>左側面>右側面>正面>背面
+            "front-left": [
+                "back-right",
+                "front-right",
+                "back-left",
+                "left",
+                "right",
+                "front",
+                "back",
+            ],
+            # 正面がない場合
+            #   背面>右前斜め>左前斜め>後ろ左斜め>後ろ右斜め>右側面>左側面
+            "front": [
+                "back",
+                "front-right",
+                "front-left",
+                "back-left",
+                "back-right",
+                "right",
+                "left",
+            ],
+            # 背面がない場合
+            #   正面>右前斜め>左前斜め>後ろ左斜め>後ろ右斜め>右側面>左側面
+            "back": [
+                "front",
+                "front-right",
+                "front-left",
+                "back-left",
+                "back-right",
+                "right",
+                "left",
+            ],
+            # 右後ろ斜めがない場合
+            #   左前斜め>後ろ左斜め>右前斜め>正面>背面>右側面>左側面
+            "back-right": [
+                "front-left",
+                "back-left",
+                "front-right",
+                "front",
+                "back",
+                "right",
+                "left",
+            ],
+            # 左後ろ斜めがない場合
+            #   右前斜め>後ろ右斜め>左前斜め>正面>背面>左側面>右側面
+            "back-left": [
+                "front-right",
+                "back-right",
+                "front-left",
+                "front",
+                "back",
+                "left",
+                "right",
+            ],
+            # 左側面がない場合
+            #   右側面>左前斜め>後ろ左斜め>右前斜め>後ろ右斜め>正面>背面
+            "left": [
+                "right",
+                "front-left",
+                "back-left",
+                "front-right",
+                "back-right",
+                "front",
+                "back",
+            ],
+            # 右側面がない場合
+            #   左側面>右前斜め>後ろ右斜め>左前斜め>後ろ左斜め>正面>背面
+            "right": [
+                "left",
+                "front-right",
+                "back-right",
+                "front-left",
+                "back-left",
+                "front",
+                "back",
+            ],
+        }
+
+        # need が未設定 or 想定外の値の場合は、とりあえず優先順なしで default_vec へ
+        if not need or need not in fallback_rules:
+            return default_vec
+
+        # 指定された優先順で「次善の向き」を探す
+        for alt in fallback_rules[need]:
+            if alt in norm_map:
+                return norm_map[alt]
+
+        # ここまで来たら、そのラベルについては dir8 ギャラリーなし → 非dir8にフォールバック
+        return default_vec
+    
     def _pose_for_face_index(self, idx_face: int) -> Optional[str]:
         """
         顔BBOXに最も対応しそうなPose（人物）を探して、_classify_face_pose_from_kpts() で向きを返す。
@@ -3218,42 +3508,78 @@ class AutoController(QObject):
     def _update_gait_tracks(self) -> None:
         """
         現フレームの pose キーポイントと track_id から、
-        track_id ごとの歩容シーケンス deque を更新する。
-
-        - self._kpts_pose : List[np.ndarray] or np.ndarray, shape (Np, 17, 3)
-        - self._track_ids_pose : List[int] or np.ndarray, shape (Np,)
+        track_id ごとの歩容シーケンス deque を更新する（既存処理）。
+        さらに：
+        - dir8（8方向）を track ごとに deque で保存
+        - AUTO_GAIT_DIR8_WINDOW フレームごとに多数決で現在の dir8 を更新
+        ※ 既存処理は一切壊さない。
         """
-        # 属性がまだ無ければ初期化
+        # ---- 既存：歩容シーケンス deque 初期化 ----
         if not hasattr(self, "_gait_tracks"):
             self._gait_tracks = {}
 
+        # ---- 追加：dir8 関連の初期化 ----
+        if not hasattr(self, "_gait_dir8_tracks"):
+            self._gait_dir8_tracks = {}     # {tid: deque(maxlen=W)}
+        if not hasattr(self, "_gait_dir8_current"):
+            self._gait_dir8_current = {}    # {tid: "front-right" ...}
+
+        # ---- pose キーポイントと track_id を取得 ----
         kpts_list = getattr(self, "_kpts_pose", None)
         track_ids = getattr(self, "_track_ids_pose", None)
 
         if kpts_list is None or track_ids is None:
             return
 
-        # numpy / list 両対応のため enumerate で回す
+        W = max(int(AUTO_GAIT_DIR8_WINDOW), 1)
+
+        # ---- numpy / list 両対応のため enumerate で回す（既存仕様）----
         for pose_idx, tid in enumerate(track_ids):
             if tid is None or tid < 0:
-                # 無効 track_id は無視
                 continue
 
-            # deque がなければ作る
+            # ------------------------------
+            # ① 既存：歩容シーケンス更新（変更しない）
+            # ------------------------------
             dq = self._gait_tracks.get(tid)
             if dq is None:
-                dq = deque(maxlen=AUTO_GAIT_FRAMES)
+                dq = deque(maxlen=WINDOW_T)
                 self._gait_tracks[tid] = dq
 
-            # 対応するキーポイントを追加
             try:
-                kpts = kpts_list[pose_idx]
+                kpts = kpts_list[pose_idx]   # (17,3)
             except Exception:
                 continue
             if kpts is None:
                 continue
 
-            dq.append(kpts)
+            dq.append(np.asarray(kpts, np.float32))
+
+            # ------------------------------
+            # ② 新規：dir8（8方向）を推定して保存
+            # ------------------------------
+            dir8 = self._analyze_body_dir8_from_kpts(kpts)
+            if dir8 is None:
+                # 推定できないフレームはスキップ（既存処理を邪魔しない）
+                continue
+
+            dq_d = self._gait_dir8_tracks.get(tid)
+            if dq_d is None:
+                dq_d = deque(maxlen=W)
+                self._gait_dir8_tracks[tid] = dq_d
+
+            dq_d.append(str(dir8))
+
+            # ------------------------------
+            # ③ W フレーム（例：10フレーム）ごとに多数決で向き更新
+            # ------------------------------
+            if len(dq_d) % W == 0 or len(dq_d) == 1:
+                lab = self._majority_label(list(dq_d))
+                if lab:
+                    self._gait_dir8_current[tid] = lab
+
+        # ---- 返り値は既存仕様に合わせて None（不要なので変更しない）----
+        return None
             
     def _build_gait_queries_from_tracks(self) -> tuple[list[int], list[np.ndarray]]:
         """
@@ -3281,7 +3607,7 @@ class AutoController(QObject):
             dq = self._gait_tracks.get(tid)
             if dq is None:
                 continue
-            if len(dq) < AUTO_GAIT_FRAMES:
+            if len(dq) < WINDOW_T:
                 # まだ T フレームたまっていない
                 continue
 
@@ -3291,3 +3617,423 @@ class AutoController(QObject):
             seq_list.append(seq)
 
         return out_track_ids, seq_list
+
+    def _calc_body_yaw_deg_from_kpts_dir8(self, k3: np.ndarray) -> Optional[float]:
+        """
+        COCO-17 キーポイント (K,3) から「体の横方向ベクトル」を作り、
+        yaw 角度 [deg] を返す（-180〜180）。
+
+        使用点:
+          - 左肩(5), 右肩(6)
+          - 左腰(11), 右腰(12)
+        """
+        if k3 is None:
+            return None
+
+        k3 = np.asarray(k3, dtype=np.float32)
+        if k3.ndim != 2 or k3.shape[1] < 2:
+            return None
+
+        K = k3.shape[0]
+        idx_ls, idx_rs = 5, 6   # shoulders
+        idx_lh, idx_rh = 11, 12 # hips
+
+        def _get_pt(idx: int) -> Optional[np.ndarray]:
+            if idx >= K:
+                return None
+            x, y = float(k3[idx, 0]), float(k3[idx, 1])
+            c = float(k3[idx, 2]) if k3.shape[1] >= 3 else 1.0
+            if not (np.isfinite(x) and np.isfinite(y)):
+                return None
+            if c < float(POSE_KPT_CONF_MIN):
+                return None
+            return np.array([x, y], dtype=np.float32)
+
+        ls = _get_pt(idx_ls)
+        rs = _get_pt(idx_rs)
+        lh = _get_pt(idx_lh)
+        rh = _get_pt(idx_rh)
+        if ls is None or rs is None or lh is None or rh is None:
+            return None
+
+        v_shoulders = rs - ls
+        v_hips      = rh - lh
+        v = 0.5 * (v_shoulders + v_hips)
+
+        vx, vy = float(v[0]), float(v[1])
+        if not (np.isfinite(vx) and np.isfinite(vy)):
+            return None
+        if abs(vx) + abs(vy) < 1e-6:
+            return None
+
+        # atan2(x, y) として、0°=画面下方向、+90°=右方向あたり
+        yaw_rad = math.atan2(vx, vy)
+        yaw_deg = math.degrees(yaw_rad)
+
+        # [-180, 180) に正規化
+        if yaw_deg <= -180.0 or yaw_deg > 180.0:
+            yaw_deg = ((yaw_deg + 180.0) % 360.0) - 180.0
+
+        return float(yaw_deg)
+
+    def _classify_body_dir8(self, yaw_deg: float) -> str:
+        """
+        yaw_deg [-180, 180) を 8方向に量子化してラベルを返す。
+        """
+        a = float(yaw_deg)
+        if a <= -180.0 or a > 180.0:
+            a = ((a + 180.0) % 360.0) - 180.0
+
+        if -22.5 <= a < 22.5:
+            return "front"
+        if 22.5 <= a < 67.5:
+            return "front-right"
+        if 67.5 <= a < 112.5:
+            return "right"
+        if 112.5 <= a < 157.5:
+            return "back-right"
+        if a >= 157.5 or a < -157.5:
+            return "back"
+        if -157.5 <= a < -112.5:
+            return "back-left"
+        if -112.5 <= a < -67.5:
+            return "left"
+        # -67.5 ~ -22.5
+        return "front-left"
+
+    def _maybe_log_gait_dir8_learning(self, k3: np.ndarray, seq_len: int) -> None:
+        """
+        gait特徴学習用:
+        - シーケンス長 seq_len を見て、WINDOW_T=32 のうち
+          30, 31, 32 フレーム目のときだけ 8方向ラベルをログ出力する。
+        - その 3 フレーム分の dir8 を _gait_dir8_last3 に保持する。
+        """
+        try:
+            T = int(WINDOW_T)
+            if seq_len < T - 2 or seq_len > T:
+                return
+
+            dir8 = self._analyze_body_dir8_from_kpts(k3)
+
+            # バッファ初期化
+            if not hasattr(self, "_gait_dir8_last3"):
+                self._gait_dir8_last3: List[str] = []
+
+            if dir8 is None:
+                self.log.info(
+                    "[YOLO-POSE][DIR8][GAIT] seq_len=%d dir8=None",
+                    seq_len,
+                )
+                # None は多数決には使わない
+                return
+
+            # 最後3フレームだけ保持
+            self._gait_dir8_last3.append(str(dir8))
+            if len(self._gait_dir8_last3) > 3:
+                self._gait_dir8_last3 = self._gait_dir8_last3[-3:]
+
+            self.log.info(
+                "[YOLO-POSE][DIR8][GAIT] seq_len=%d -> dir8=%s",
+                seq_len,
+                dir8,
+            )
+        except Exception as e:
+            # デバッグ用途なので失敗しても致命傷にはしない
+            self.log.debug("[YOLO-POSE][DIR8][GAIT] failed: %s", e)
+            
+    def _analyze_body_dir8_from_kpts(self, k3: np.ndarray) -> Optional[str]:
+        """
+        COCO-17 キーポイント (K,3) から 8方向ラベルを決める。
+        戻り値:
+          "front", "front-right", "right", "back-right",
+          "back", "back-left", "left", "front-left"
+          判定不能なときは None。
+        """
+
+        if k3 is None:
+            return None
+
+        k3 = np.asarray(k3, dtype=np.float32)
+        if k3.ndim != 2 or k3.shape[1] < 2:
+            return None
+
+        K = k3.shape[0]
+
+        # COCOインデックス
+        idx_nose   = 0
+        idx_eyeL   = 1
+        idx_eyeR   = 2
+        idx_earL   = 3
+        idx_earR   = 4
+        idx_shoL   = 5
+        idx_shoR   = 6
+        idx_hipL   = 11
+        idx_hipR   = 12
+
+        def _get_pt(idx: int) -> Optional[Tuple[float, float, float]]:
+            if idx >= K:
+                return None
+            x = float(k3[idx, 0])
+            y = float(k3[idx, 1])
+            c = float(k3[idx, 2]) if k3.shape[1] >= 3 else 1.0
+            if not (np.isfinite(x) and np.isfinite(y)):
+                return None
+            if c < float(POSE_KPT_CONF_MIN):
+                return None
+            return x, y, c
+
+        nose = _get_pt(idx_nose)
+        eyeL = _get_pt(idx_eyeL)
+        eyeR = _get_pt(idx_eyeR)
+        earL = _get_pt(idx_earL)
+        earR = _get_pt(idx_earR)
+        shoL = _get_pt(idx_shoL)
+        shoR = _get_pt(idx_shoR)
+        hipL = _get_pt(idx_hipL)
+        hipR = _get_pt(idx_hipR)
+
+        vis_nose = nose is not None
+        vis_eyeL = eyeL is not None
+        vis_eyeR = eyeR is not None
+        vis_earL = earL is not None
+        vis_earR = earR is not None
+
+        # --- 腰幅（真横判定に使う） ---
+        hip_width = None
+        if hipL is not None and hipR is not None:
+            x_hipL, y_hipL, _ = hipL
+            x_hipR, y_hipR, _ = hipR
+            hip_width = float(np.hypot(x_hipR - x_hipL, y_hipR - y_hipL))
+
+        # -------------------------------
+        # 0. まず「真横」かどうかを判定
+        #    条件: 片目だけ見える + 腰幅 ≒ 耳〜目距離
+        # -------------------------------
+        if hip_width is not None and hip_width > 1e-3:
+            # 比率がこのレンジに入っていたら「ほぼ同じ長さ」
+            SIDE_RATIO_MIN = 0.7
+            SIDE_RATIO_MAX = 1.3
+
+            # 片目だけ
+            one_eye_only = (vis_eyeL ^ vis_eyeR)
+
+            if one_eye_only:
+                # 左側プロファイル（画面から見て右向き）
+                if vis_eyeL and earL is not None:
+                    x_eL, y_eL, _ = earL
+                    x_vL, y_vL, _ = eyeL
+                    face_len = float(np.hypot(x_eL - x_vL, y_eL - y_vL))
+                    if face_len > 1e-3:
+                        ratio = face_len / hip_width
+                        if SIDE_RATIO_MIN <= ratio <= SIDE_RATIO_MAX:
+                            # 真横：左側が見える → 画面から見て right
+                            return "right"
+
+                # 右側プロファイル（画面から見て左向き）
+                if vis_eyeR and earR is not None:
+                    x_eR, y_eR, _ = earR
+                    x_vR, y_vR, _ = eyeR
+                    face_len = float(np.hypot(x_eR - x_vR, y_eR - y_vR))
+                    if face_len > 1e-3:
+                        ratio = face_len / hip_width
+                        if SIDE_RATIO_MIN <= ratio <= SIDE_RATIO_MAX:
+                            # 真横：右側が見える → 画面から見て left
+                            return "left"
+
+        # -------------------------------
+        # 1. front系 / back系 の大まかな判定
+        # -------------------------------
+        front_like = vis_nose or vis_eyeL or vis_eyeR
+        back_like  = (not front_like) and (vis_earL or vis_earR)
+
+        # -------------------------------
+        # 2. front系: 斜め前 / 正面
+        #    仕様: 斜め前 = 鼻が肩と同じくらいか、それより外側に出ている
+        #          それ以外は front に寄せる
+        # -------------------------------
+        if front_like:
+            # 肩 or 鼻が足りないときは細かく分けず front
+            if nose is None or shoL is None or shoR is None:
+                return "front"
+
+            x_nose, _, _ = nose
+            x_shoL, _, _ = shoL
+            x_shoR, _, _ = shoR
+
+            x_min = min(x_shoL, x_shoR)
+            x_max = max(x_shoL, x_shoR)
+
+            # 肩の外側まで鼻が出ていたら「斜め前」
+            if x_nose <= x_min or x_nose >= x_max:
+                # どちら側に出ているかで left/right を決める
+                if x_nose >= x_max:
+                    # 右肩側に鼻が出ている → 画面から見て right 前
+                    return "front-right"
+                else:
+                    # 左肩側に鼻が出ている → 画面から見て left 前
+                    return "front-left"
+
+            # 肩の間に収まっている → 正面寄りに振る
+            return "front"
+
+        # -------------------------------
+        # 3. back系: 斜め後ろ / 真後ろ
+        #    仕様:
+        #      斜め後ろ = 片耳のみ、または「耳〜目距離がほぼゼロ」
+        # -------------------------------
+        if back_like:
+            tiny_joint_L = False
+            tiny_joint_R = False
+            TINY_RATIO = 0.2  # 「ほぼゼロ」とみなす比率
+
+            if hip_width is not None and hip_width > 1e-3:
+                # 左側の耳〜目ジョイント長
+                if earL is not None and eyeL is not None:
+                    x_eL, y_eL, _ = earL
+                    x_vL, y_vL, _ = eyeL
+                    face_len_L = float(np.hypot(x_eL - x_vL, y_eL - y_vL))
+                    if face_len_L / hip_width < TINY_RATIO:
+                        tiny_joint_L = True
+
+                # 右側の耳〜目ジョイント長
+                if earR is not None and eyeR is not None:
+                    x_eR, y_eR, _ = earR
+                    x_vR, y_vR, _ = eyeR
+                    face_len_R = float(np.hypot(x_eR - x_vR, y_eR - y_vR))
+                    if face_len_R / hip_width < TINY_RATIO:
+                        tiny_joint_R = True
+
+            # 片耳のみ or 「耳〜目ほぼゼロ」 → 斜め後ろ
+            # left_ear 側が見える → back-right（背中＋左側が見えている）
+            if (vis_earL and not vis_earR) or tiny_joint_L:
+                return "back-right"
+
+            # right_ear 側が見える → back-left
+            if (vis_earR and not vis_earL) or tiny_joint_R:
+                return "back-left"
+
+            # 両耳＋顔なし → 真後ろ
+            if vis_earL and vis_earR and not front_like:
+                return "back"
+
+        # -------------------------------
+        # 4. ここまで来たら、細かく判定できなかったケース。
+        #    肩だけで left/right くらいは返す。
+        # -------------------------------
+        if shoL is not None and shoR is not None:
+            x_shoL, _, _ = shoL
+            x_shoR, _, _ = shoR
+            if abs(x_shoR - x_shoL) > 1e-3:
+                # ざっくり横向き扱い
+                return "right" if x_shoR > x_shoL else "left"
+
+        # 判定不能
+        return None
+    
+    def _decide_gait_seq_dir8(self) -> Optional[str]:
+        """
+        現在の学習シーケンスに対して、最後3フレーム分の dir8 から
+        そのシーケンスの代表 dir8 を1つ決める。
+        - 多数決（同数の場合は「最後に出たラベル」を優先）
+        """
+        labels = [s for s in getattr(self, "_gait_dir8_last3", []) if s]
+        if not labels:
+            return None
+
+        from collections import Counter
+        cnt = Counter(labels)
+        best_count = max(cnt.values())
+        candidates = [lab for lab, c in cnt.items() if c == best_count]
+
+        # 同数のときは「最後に出たラベル」を優先
+        for lab in reversed(labels):
+            if lab in candidates:
+                return lab
+
+        return labels[-1]
+    
+    def _majority_label(self, labels: List[str]) -> Optional[str]:
+        """
+        文字列ラベルのリストから、多数決で代表ラベルを1つ返す。
+        同数の場合は「最後に出現したラベル」を優先。
+        """
+        labels = [str(x) for x in labels if x]
+        if not labels:
+            return None
+
+        from collections import Counter
+        cnt = Counter(labels)
+        best_count = max(cnt.values())
+        candidates = [lab for lab, c in cnt.items() if c == best_count]
+
+        # 同票のときは「最後に出たラベル」を優先
+        for lab in reversed(labels):
+            if lab in candidates:
+                return lab
+
+        return candidates[0]
+    
+    def _load_gait_gallery_by_dir8(self, label: str) -> Dict[str, np.ndarray]:
+        """
+        gait_gallery.json の records から、
+        指定 label の 8方向(dir8)別平均ベクトルを作る。
+
+        - 新形式: rec["dir8"] を優先して使う
+        - 旧形式: rec["dir8"] が無い場合は rec["view"] を dir8 とみなして使う
+        戻り値:
+            { "front": vec, "front-right": vec, "back-left": vec, ... }
+        """
+        label = (label or "").strip()
+        path = AUTO_GAIT_JSON
+        dir8_map: Dict[str, list] = {}
+
+        try:
+            if not (path and os.path.isfile(path)):
+                return {}
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return {}
+
+        # records を取り出し（dict でも list でも対応）
+        recs = []
+        if isinstance(data, dict) and isinstance(data.get("records"), list):
+            recs = data["records"]
+        elif isinstance(data, list):
+            recs = data
+        else:
+            return {}
+
+        for rec in recs:
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("label", "")).strip() != label:
+                continue
+
+            # 新形式: dir8 / 旧形式: view をフォールバックとして使用
+            dir8 = str(rec.get("dir8") or rec.get("view") or "").strip().lower()
+            if not dir8:
+                continue
+
+            v = rec.get("vec")
+            if v is None:
+                continue
+
+            v = np.asarray(v, np.float32).reshape(-1)
+            if v.size == 0:
+                continue
+
+            # L2正規化
+            n = float(np.linalg.norm(v) + 1e-12)
+            v = v / n
+
+            dir8_map.setdefault(dir8, []).append(v)
+
+        # 各 dir8 ごとに平均して np.ndarray に
+        out: Dict[str, np.ndarray] = {}
+        for d8, vecs in dir8_map.items():
+            vv = np.stack(vecs, axis=0).mean(axis=0)
+            n = float(np.linalg.norm(vv) + 1e-12)
+            out[d8] = (vv / n).astype(np.float32)
+
+        return out

@@ -10,8 +10,12 @@ from __future__ import annotations
 from typing import Optional, Tuple, List
 import numpy as np
 import cv2
+import math
+import logging 
 
 import onnxruntime as ort
+
+log = logging.getLogger("app.yolo_pose")
 
 # --- 設定の相対/絶対フォールバック ---
 try:
@@ -145,6 +149,111 @@ def _passes_hard_filter(k3: np.ndarray) -> bool:
             if notok >= 4:
                 return False
     return True
+
+def _calc_body_yaw_deg_from_kpts(k3: np.ndarray,
+                                 conf_min: float = POSE_KPT_CONF_MIN) -> Optional[float]:
+    """
+    COCO-17 キーポイント (K,3) から「体の横方向ベクトル」を作り、 yaw 角度 [deg] を返す。
+
+    使用点:
+      - 左肩(5), 右肩(6)
+      - 左腰(11), 右腰(12)
+
+    ベクトル:
+      v_shoulders = R_shoulder - L_shoulder
+      v_hips      = R_hip      - L_hip
+      v           = 0.5 * (v_shoulders + v_hips)
+
+    角度定義:
+      yaw_rad = atan2(vx, vy)
+      yaw_deg = degrees(yaw_rad) in [-180, 180)
+    """
+    if k3 is None:
+        return None
+
+    k3 = np.asarray(k3, dtype=np.float32)
+    if k3.ndim != 2 or k3.shape[1] < 2:
+        return None
+
+    K = k3.shape[0]
+    idx_ls, idx_rs = 5, 6   # shoulders
+    idx_lh, idx_rh = 11, 12 # hips
+
+    def _get_pt(idx: int) -> Optional[np.ndarray]:
+        if idx >= K:
+            return None
+        x, y = float(k3[idx, 0]), float(k3[idx, 1])
+        c = float(k3[idx, 2]) if k3.shape[1] >= 3 else 1.0
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return None
+        if c < conf_min:
+            return None
+        return np.array([x, y], dtype=np.float32)
+
+    ls = _get_pt(idx_ls)
+    rs = _get_pt(idx_rs)
+    lh = _get_pt(idx_lh)
+    rh = _get_pt(idx_rh)
+    if ls is None or rs is None or lh is None or rh is None:
+        return None
+
+    v_shoulders = rs - ls
+    v_hips      = rh - lh
+    v = 0.5 * (v_shoulders + v_hips)
+
+    vx, vy = float(v[0]), float(v[1])
+    if not (np.isfinite(vx) and np.isfinite(vy)):
+        return None
+    if abs(vx) + abs(vy) < 1e-6:
+        return None
+
+    # atan2(x, y) なので、0° は「画像の下方向」、+90° は「右方向」あたり
+    yaw_rad = math.atan2(vx, vy)
+    yaw_deg = math.degrees(yaw_rad)
+
+    # [-180, 180) に正規化
+    if yaw_deg <= -180.0 or yaw_deg > 180.0:
+        yaw_deg = ((yaw_deg + 180.0) % 360.0) - 180.0
+
+    return float(yaw_deg)
+
+
+def _classify_body_dir8(yaw_deg: float) -> str:
+    """
+    yaw_deg [-180, 180) を 8方向に量子化してラベルを返す。
+
+    ざっくり:
+      -22.5 ~ +22.5         : front
+      +22.5 ~ +67.5         : front-right
+      +67.5 ~ +112.5        : right
+      +112.5 ~ +157.5       : back-right
+      +157.5~180 / -180~-157.5: back
+      -157.5 ~ -112.5       : back-left
+      -112.5 ~ -67.5        : left
+      -67.5 ~ -22.5         : front-left
+    """
+    a = float(yaw_deg)
+    # いちおう [-180,180) に揃える
+    if a <= -180.0 or a > 180.0:
+        a = ((a + 180.0) % 360.0) - 180.0
+
+    if -22.5 <= a < 22.5:
+        return "front"
+    if 22.5 <= a < 67.5:
+        return "front-right"
+    if 67.5 <= a < 112.5:
+        return "right"
+    if 112.5 <= a < 157.5:
+        return "back-right"
+    if a >= 157.5 or a < -157.5:
+        return "back"
+    if -157.5 <= a < -112.5:
+        return "back-left"
+    if -112.5 <= a < -67.5:
+        return "left"
+    # -67.5 ~ -22.5
+    return "front-left"
+
 
 
 class YOLOPoseDetector:
@@ -304,11 +413,35 @@ class YOLOPoseDetector:
 
         return boxes.astype(np.float32, copy=False), scores.astype(np.float32, copy=False), kpts.astype(np.float32, copy=False)
 
-    def detect_and_draw(self, frame_bgr: np.ndarray, show_score: bool = True):
+    def detect_and_draw(self,
+                        frame_bgr: np.ndarray,
+                        show_score: bool = True,
+                        debug_dir8: bool = False):
         """
         検出＋骨格/BBOXをインプレース描画。
+
+        debug_dir8=True のとき:
+          - 各人物について肩・腰から yaw 角を計算
+          - 8方向ラベルに量子化してログ出力のみ行う
         """
         boxes, scores, kpts = self.detect(frame_bgr)
+
+        # ★ 8方向のデバッグログ（普段は OFF / 学習時だけ ON にする想定）
+        if debug_dir8 and kpts is not None and kpts.size > 0:
+            try:
+                n = min(len(boxes), len(kpts))
+            except Exception:
+                n = 0
+            for i in range(n):
+                yaw = _calc_body_yaw_deg_from_kpts(kpts[i])
+                if yaw is None:
+                    continue
+                dir8 = _classify_body_dir8(yaw)
+                log.info(
+                    "[YOLO-POSE][DIR8] idx=%d yaw=%.1f deg -> %s",
+                    i, yaw, dir8,
+                )
+
         if POSE_DRAW_ENABLED:
             self._draw_pose(frame_bgr, boxes, scores, kpts, show_score=show_score)
         return boxes, scores, kpts

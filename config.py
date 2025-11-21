@@ -91,6 +91,19 @@ AUTO_FACE_THRESH_DEFAULT = 0.20000  # 顔閾値
 AUTO_APP_THRESH_DEFAULT  = 0.80000  # 外見閾値
 AUTO_GAIT_THRESH_DEFAULT = 0.99700  # 歩容閾値
 
+AUTO_FACE_PRI_THRESH_DEFAULT = 0.40000
+AUTO_APP_PRI_THRESH_DEFAULT = 0.90000
+AUTO_GAIT_PRI_THRESH_DEFAULT = 0.99950
+
+AUTO_RANK_GROUP_ORDER: list[str] = [
+    "face_hi",
+    "app_hi",
+    "face_lo",
+    "app_lo",
+    "gait_hi",
+    "gait_lo",
+]
+
 # ランキングモード
 # "face" : 顔 > 外見 > 歩容 の優先度で、ランキングに使うモダリティを決定
 AUTO_RANK_MODE: str = "face"
@@ -198,8 +211,8 @@ GAIT_MIXER_MODEL_PATH = "models/GaitMixer.pt"
 
 # GaitMixer用 TTA の有効/無効
 TTA_FLIP_ENABLED: bool  = True   # 左右反転TTA（flip_tta_embed）のON/OFF
-TTA_NOISE_ENABLED: bool = True  # ノイズTTA（noise_tta_embed）のON/OFF
-TTA_TEMPORAL_ENABLED: bool  = True  # 時間反転TTAのON/OFF
+TTA_NOISE_ENABLED: bool = False  # ノイズTTA（noise_tta_embed）のON/OFF
+TTA_TEMPORAL_ENABLED: bool  = False  # 時間反転TTAのON/OFF
 
 # GaitMixer用 左右反転TTA
 # COCO 17の左右対応
@@ -271,6 +284,25 @@ TTA_SCORE_TOPK: int = 2
 YAW_MIN_SHOULDER_PX: int = 30         # 肩幅が小さい時は未確定扱い
 YAW_MIN_VIS: float = 0.60             # 肩のvisibility平均が低い時は未確定扱い
 
+# gait / pose weighting 用
+GAIT_POSE_WEIGHT_ENABLE: bool = False
+
+# 上半身（手首・肘・肩）のスケーリング
+GAIT_POSE_WEIGHT_UPPER: float = 0.8  # 例: 0.5〜0.7 の間で調整
+
+# 下半身（11〜16）のスケーリング
+GAIT_POSE_WEIGHT_LOWER: float = 1.2  # 例: 脚を強調
+
+# 正規化後の振幅標準化
+GAIT_POSE_STD_NORM_ENABLE: bool = False
+GAIT_POSE_STD_CLIP: float = 3.0      # 標準偏差3σでクリップ、など
+GAIT_POSE_STD_EPS: float = 1e-6
+
+GAIT_VEL_AUG_ENABLED: bool = True
+GAIT_VEL_AUG_ALPHA: float  = 0.5   # 0.3〜0.8くらいで調整
+
+AUTO_GAIT_DIR8_WINDOW: int = 10
+
 # BBOX→切り出し時の外枠パディング（枠をわずかに広げて上下端欠けを防ぐ）
 REID_CROP_PAD_RATIO   = 0.05
 
@@ -299,7 +331,7 @@ AUTO_GAIT_YAW_ENABLED = False
 # Auto mode
 AUTO_MODE_NAME = "マルチモーダル"
 AUTO_FACE_FRAMES = 3      # 顔：最初に積むフレーム数
-AUTO_APP_FRAMES  = 5     # 外見：最初に積むフレーム数
+AUTO_APP_FRAMES  = 8     # 外見：最初に積むフレーム数
 AUTO_GAIT_FRAMES = 32     # 歩容：最初に積むフレーム数
 
 # === AUTO (顔+外見+歩容) 共通保存先 / 連番仕様 ===
@@ -311,3 +343,4 @@ AUTO_GAIT_JSON     = os.path.join(AUTO_GALLERY_DIR, "gait_gallery.json")
 # ベース名 + "-" + PREFIX + 連番 の形式で採番（例: "Mizuta-P0001"）
 AUTO_SERIAL_PREFIX = "P"
 AUTO_SERIAL_WIDTH  = 4
+

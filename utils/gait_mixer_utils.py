@@ -2,6 +2,7 @@
 from __future__ import annotations
 import numpy as np
 from typing import Callable, Optional, List, Tuple
+import torch
 
 from ..config import (
     NORM_CENTER_HIPS,
@@ -28,7 +29,13 @@ from ..config import (
     HYBRID_TTA_ENABLED,
     HYBRID_TTA_ALPHA,
     TTA_MODES,
-    TTA_SCORE_TOPK
+    TTA_SCORE_TOPK,
+    GAIT_POSE_WEIGHT_ENABLE,
+    GAIT_POSE_WEIGHT_UPPER,
+    GAIT_POSE_WEIGHT_LOWER,
+    GAIT_POSE_STD_NORM_ENABLE,
+    GAIT_POSE_STD_CLIP,
+    GAIT_POSE_STD_EPS,
 )
 
 
@@ -315,12 +322,29 @@ class GaitUtils:
     @staticmethod
     def _flip_sequence_xy(seq: np.ndarray) -> np.ndarray:
         """
-        (T,K,2) の左右反転。xのみ符号反転（正規化座標前提）。左右ジョイント入替が必要なら
-        ここに既存の左右ペアスワップ処理を差し込むか、あなたの既存関数で置き換えてください。
+        (T, K, 2) の左右反転。
+        - x座標の符号反転（正規化後座標を前提）
+        - COCO_LR_PAIRS に基づく左右ジョイント入れ替え
         """
-        a = np.asarray(seq, dtype=np.float32).copy()
+        a = np.asarray(seq, dtype=np.float32)
+        if a.ndim != 3 or a.shape[-1] != 2:
+            raise ValueError("_flip_sequence_xy: expected shape (T, K, 2).")
+
+        # コピーしてから操作
+        a = a.copy()
+
+        # x座標を反転
         a[..., 0] = -a[..., 0]
-        # 例：左右ペアのスワップが必要ならここで実施（あなたの既存スワップ実装があれば置換）
+
+        # 関節インデックス数を取得
+        _, K, _ = a.shape
+
+        # 左右ペアをスワップ（範囲外インデックスは無視）
+        for li, ri in COCO_LR_PAIRS:
+            if li < 0 or ri < 0 or li >= K or ri >= K:
+                continue
+            a[:, [li, ri], :] = a[:, [ri, li], :]
+
         return a
 
     def _make_tta_sequences(self, seq_xy: np.ndarray) -> List[np.ndarray]:
@@ -514,3 +538,118 @@ class GaitUtils:
 
         # 未知指定は素通し
         return x
+
+    def _to_numpy(self, x):
+        """torch.Tensor / np.ndarray 両対応の簡易ユーティリティ"""
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy(), True
+        return x, False
+
+    def _from_numpy(self, x_np, as_tensor: bool, device=None):
+        if as_tensor:
+            t = torch.from_numpy(x_np)
+            if device is not None:
+                t = t.to(device)
+            return t
+        return x_np
+
+    def apply_pose_joint_weights(
+        self,
+        kpts: np.ndarray | torch.Tensor,
+    ) -> np.ndarray | torch.Tensor:
+        """
+        手首・肘・肩を弱め、下半身を強めるための座標スケーリング。
+        normalize_pose() に渡す「直前」で呼び出す想定。
+
+        期待形状: (T, J, C) or (B, T, J, C)
+        - C >= 2 (x, y, [conf ...])
+        """
+        if not GAIT_POSE_WEIGHT_ENABLE:
+            return kpts
+
+        x_np, as_tensor = self._to_numpy(kpts)
+
+        # (T, J, C) or (B, T, J, C) 以外は素通し
+        if x_np.ndim == 4:
+            # (B, T, J, C) → バッチはそのまま、末尾2軸だけスケーリング対象
+            pass
+        elif x_np.ndim != 3:
+            return self._from_numpy(x_np, as_tensor, getattr(kpts, "device", None))
+
+        # 重み
+        w_upper = float(GAIT_POSE_WEIGHT_UPPER)
+        w_lower = float(GAIT_POSE_WEIGHT_LOWER)
+
+        # 関節 index（COCO-17 前提）
+        upper_ids = [5, 6, 7, 8, 9, 10]      # 肩〜手首
+        lower_ids = [11, 12, 13, 14, 15, 16] # 腰〜足首
+
+        def _scale_joints(arr: np.ndarray) -> np.ndarray:
+            # arr: 任意次元だが最後2軸が (J, C)
+            # 上半身
+            for j in upper_ids:
+                if j < arr.shape[-2]:
+                    arr[..., j, :2] *= w_upper
+            # 下半身
+            for j in lower_ids:
+                if j < arr.shape[-2]:
+                    arr[..., j, :2] *= w_lower
+            return arr
+
+        x_np = _scale_joints(x_np)
+
+        return self._from_numpy(x_np, as_tensor, getattr(kpts, "device", None))
+
+    def standardize_pose_amplitude(
+        self,
+        kpts: np.ndarray | torch.Tensor,
+    ) -> np.ndarray | torch.Tensor:
+        """
+        normalize_pose() 後の座標について、関節ごとの振幅を標準化＆クリップ。
+        「時間方向の平均0・分散1」にして外れ値を抑えるイメージ。
+        """
+        if not GAIT_POSE_STD_NORM_ENABLE:
+            return kpts
+
+        x_np, as_tensor = self._to_numpy(kpts)
+        eps = float(GAIT_POSE_STD_EPS)
+        clip = float(GAIT_POSE_STD_CLIP)
+
+        if x_np.ndim == 3:
+            # (T, J, C) : 時間方向(T)で標準化
+            mean = x_np.mean(axis=0, keepdims=True)  # (1, J, C)
+            std = x_np.std(axis=0, keepdims=True)    # (1, J, C)
+            x_np = (x_np - mean) / (std + eps)
+            x_np = np.clip(x_np, -clip, clip)
+        elif x_np.ndim == 4:
+            # (B, T, J, C) : サンプルごとに時間方向で標準化
+            mean = x_np.mean(axis=1, keepdims=True)  # (B, 1, J, C)
+            std = x_np.std(axis=1, keepdims=True)    # (B, 1, J, C)
+            x_np = (x_np - mean) / (std + eps)
+            x_np = np.clip(x_np, -clip, clip)
+        else:
+            return self._from_numpy(x_np, as_tensor, getattr(kpts, "device", None))
+
+        return self._from_numpy(x_np, as_tensor, getattr(kpts, "device", None))
+
+    def normalize_pose_with_weighting(
+        self,
+        kpts: np.ndarray | torch.Tensor,
+    ) -> np.ndarray | torch.Tensor:
+        """
+        1. 手首・肘・肩を弱め、下半身を強める
+        2. 既存の normalize_pose() を適用
+        3. 正規化後の振幅標準化＆クリップ
+
+        という3ステップのラッパー。
+        """
+        # ① 上半身/下半身の重み付け
+        kpts = self.apply_pose_joint_weights(kpts)
+
+        # ② 既存処理でボーン長規格化など
+        kpts = self.normalize_pose(kpts)
+
+        # ③ 振幅標準化＆クリップ
+        kpts = self.standardize_pose_amplitude(kpts)
+
+        return kpts

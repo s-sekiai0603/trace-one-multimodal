@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from timm.layers import DropPath
 import numpy as np
 import logging
-from ..config import GAIT_MIXER_MODEL_PATH, TTA_FLIP_ENABLED, TTA_NOISE_ENABLED, TTA_TEMPORAL_ENABLED, COCO_LR_PAIRS
+from ..config import GAIT_MIXER_MODEL_PATH, TTA_FLIP_ENABLED, TTA_NOISE_ENABLED, TTA_TEMPORAL_ENABLED, COCO_LR_PAIRS, GAIT_VEL_AUG_ENABLED, GAIT_VEL_AUG_ALPHA
 from ..utils.gait_mixer_utils import GaitUtils
 
 log = logging.getLogger("app.gait_mixer")
@@ -377,8 +377,8 @@ class GaitMixerRunner:
                 emb = self.embed_xy_with_tta(arr)
             else:
                 # TTAなし：正規化 → モデル素通し
-                arr_norm = self.gutils.normalize_pose(arr)
-                emb = self._embed_xy_sequence(arr_norm)
+                # arr_norm = self.gutils.normalize_pose(arr)
+                emb = self._embed_xy_sequence(arr)
 
             if emb is None:
                 log.info("[GAIT] feat update skipped (embed None)")
@@ -583,7 +583,7 @@ class GaitMixerRunner:
         elif K > 17:
             xy = xy[:, :17, :]
             
-        xy = self.gutils.normalize_pose(xy)
+        # xy = self.gutils.normalize_pose(xy)
 
         return self._embed_xy_sequence(xy)  # (D,) or None
 
@@ -592,8 +592,15 @@ class GaitMixerRunner:
 
     def _embed_xy_sequence(self, xy: np.ndarray) -> np.ndarray | None:
         """
-        (T,17,2) を 32 フレームへ時間補間し、モデルで埋め込みを計算。
-        Returns: (D,) or None
+        入力: xy_raw (T,17,2)  未正規化座標
+        処理:
+        1. 32フレームにリサンプリング
+        2. normalize_pose_with_weighting で
+            - 上半身/下半身スケーリング
+            - 既存 normalize_pose
+            - 振幅標準化
+        3. モデル forward
+        出力: (D,) or None
         """
         if xy is None or xy.ndim != 3 or xy.shape[1:] != (17, 2):
             return None
@@ -601,83 +608,54 @@ class GaitMixerRunner:
         if T <= 1:
             return None
 
-        # 32フレームへ線形補間
+        # 1) まず 32 フレームへリサンプリング（生 xy に対して）
         def _resample_32(x: np.ndarray) -> np.ndarray:
-            # x: (T,17,2)
-            t_src = np.arange(T, dtype=np.float32)
-            t_dst = np.linspace(0, T - 1, 32, dtype=np.float32)
+            t_src = np.arange(x.shape[0], dtype=np.float32)
+            t_dst = np.linspace(0, x.shape[0] - 1, 32, dtype=np.float32)
             out = np.empty((32, 17, 2), np.float32)
             for j in range(17):
                 out[:, j, 0] = np.interp(t_dst, t_src, x[:, j, 0])
                 out[:, j, 1] = np.interp(t_dst, t_src, x[:, j, 1])
             return out
 
-        seq32 = _resample_32(xy) if T != 32 else xy.astype(np.float32, copy=False)
-        x = torch.from_numpy(seq32[None])  # (1,32,17,2)
+        if T != 32:
+            seq32 = _resample_32(xy)
+        else:
+            seq32 = xy.astype(np.float32, copy=False)
+
+        # 2) 重み付き＋正規化（ここで self.gutils.normalize_pose_with_weighting を使用）
+        kpts_norm = self.gutils.normalize_pose_with_weighting(seq32)  # (32,17,2)
+
+        # 3) 速度（Δxy）を用いた簡易特徴拡張（有効時のみ）
+        kpts_norm = self._apply_velocity_augmentation(kpts_norm)      # (32,17,2)
+
+        # 4) モデルへ
+        x = torch.from_numpy(kpts_norm).unsqueeze(0)  # (1,32,17,2)
+        x = x.to(next(self.model.parameters()).device)
+
         with torch.no_grad():
-            feat = self.model(x)           # (1,D)
+            feat = self.model(x)  # (1,D)
         emb = feat.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
-        # L2 正規化
-        # emb = emb / (np.linalg.norm(emb) + 1e-6)
+
         return emb
     
     def embed_xy_with_tta(self, xy: np.ndarray) -> np.ndarray | None:
-        """
-        入力: (T,17,2) の未正規化座標
-        前処理: normalize_pose
-        TTA  : noise(任意) を内包しつつ、flip / temporal を組み合わせて平均
-            - flipのみON        → [原, flip] の2系統平均
-            - temporalのみON    → [原, 逆順] の2系統平均
-            - 両方ON            → [原, flip, 逆順, 逆順+flip] の最大4系統平均
-            - どれもOFF         → 単発（原系列のみ）
-        出力: (D,)
-        """
         if xy is None or xy.ndim != 3 or xy.shape[1:] != (17, 2):
             return None
 
-        # 1) 正規化（方法B）
-        seq_norm = self.gutils.normalize_pose(xy)  # (T,17,2)
+        # 1) バリアント生成は生 xy ベース
+        variants = [xy]
 
-        # 2) 単発埋め込み（32リサンプル＋モデル）をラップ
-        def _embed_once(a_xy: np.ndarray) -> np.ndarray | None:
-            return self.embed_sequence(a_xy)  # (T,17,2) 受け
-
-        # 3) “ノイズTTAあり/なし”を内包する埋め込み関数
-        def _embed_with_optional_noise(a_xy: np.ndarray) -> np.ndarray | None:
-            if TTA_NOISE_ENABLED:
-                return self.gutils.noise_tta_embed(a_xy, _embed_once)
-            out = _embed_once(a_xy)
-            return np.asarray(out, dtype=np.float32).reshape(-1) if out is not None else None
-
-        # 4) TTAバリアント生成
-        variants: list[np.ndarray] = []
-
-        # 原系列
-        variants.append(seq_norm)
-
-        # 左右反転（座標xの符号反転＋左右ペアの入替）
         if TTA_FLIP_ENABLED:
-            flipped = seq_norm.copy()
+            flipped = xy.copy()
             flipped[..., 0] = -flipped[..., 0]
             for li, ri in COCO_LR_PAIRS:
                 flipped[:, [li, ri], :] = flipped[:, [ri, li], :]
             variants.append(flipped)
 
-        # 時間反転（逆順）
         if TTA_TEMPORAL_ENABLED:
-            rev = seq_norm[::-1].copy()
+            rev = xy[::-1].copy()
             variants.append(rev)
-
-            # 逆順＋左右反転（両方ON時のみ）
-            if TTA_FLIP_ENABLED:
-                rev_flip = rev.copy()
-                rev_flip[..., 0] = -rev_flip[..., 0]
-                for li, ri in COCO_LR_PAIRS:
-                    rev_flip[:, [li, ri], :] = rev_flip[:, [ri, li], :]
-                variants.append(rev_flip)
-            variants.append(rev)
-
-            # 逆順＋左右反転（両方ON時のみ）
             if TTA_FLIP_ENABLED:
                 rev_flip = rev.copy()
                 rev_flip[..., 0] = -rev_flip[..., 0]
@@ -685,23 +663,106 @@ class GaitMixerRunner:
                     rev_flip[:, [li, ri], :] = rev_flip[:, [ri, li], :]
                 variants.append(rev_flip)
 
-        # 5) 各バリアントを埋め込んで平均
+        # 2) ここで初めて _embed_xy_sequence を呼ぶ（中で正規化＋重み付け）
         feats = []
         for v in variants:
-            f = _embed_with_optional_noise(v)
+            if TTA_NOISE_ENABLED:
+                f = self.gutils.noise_tta_embed(v, self._embed_xy_sequence)
+            else:
+                f = self._embed_xy_sequence(v)
             if f is not None:
-                feats.append(f)
+                feats.append(f.astype(np.float32, copy=False))
 
         if not feats:
             return None
 
         feat = np.mean(np.stack(feats, axis=0), axis=0).astype(np.float32, copy=False)
-        
-        n = float(np.linalg.norm(feat)) + 1e-12 
-        if n > 0:
+        n = float(np.linalg.norm(feat))
+        if n > 1e-12:
             feat = feat / n
-            
         return feat
+        
+    # def embed_xy_with_tta(self, xy: np.ndarray) -> np.ndarray | None:
+    #     """
+    #     入力: (T,17,2) の未正規化座標
+    #     前処理: normalize_pose
+    #     TTA  : noise(任意) を内包しつつ、flip / temporal を組み合わせて平均
+    #         - flipのみON        → [原, flip] の2系統平均
+    #         - temporalのみON    → [原, 逆順] の2系統平均
+    #         - 両方ON            → [原, flip, 逆順, 逆順+flip] の最大4系統平均
+    #         - どれもOFF         → 単発（原系列のみ）
+    #     出力: (D,)
+    #     """
+    #     if xy is None or xy.ndim != 3 or xy.shape[1:] != (17, 2):
+    #         return None
+
+    #     # 1) 正規化（方法B）
+    #     seq_norm = self.gutils.normalize_pose(xy)  # (T,17,2)
+
+    #     # 2) 単発埋め込み（32リサンプル＋モデル）をラップ
+    #     def _embed_once(a_xy: np.ndarray) -> np.ndarray | None:
+    #         return self.embed_sequence(a_xy)  # (T,17,2) 受け
+
+    #     # 3) “ノイズTTAあり/なし”を内包する埋め込み関数
+    #     def _embed_with_optional_noise(a_xy: np.ndarray) -> np.ndarray | None:
+    #         if TTA_NOISE_ENABLED:
+    #             return self.gutils.noise_tta_embed(a_xy, _embed_once)
+    #         out = _embed_once(a_xy)
+    #         return np.asarray(out, dtype=np.float32).reshape(-1) if out is not None else None
+
+    #     # 4) TTAバリアント生成
+    #     variants: list[np.ndarray] = []
+
+    #     # 原系列
+    #     variants.append(seq_norm)
+
+    #     # 左右反転（座標xの符号反転＋左右ペアの入替）
+    #     if TTA_FLIP_ENABLED:
+    #         flipped = seq_norm.copy()
+    #         flipped[..., 0] = -flipped[..., 0]
+    #         for li, ri in COCO_LR_PAIRS:
+    #             flipped[:, [li, ri], :] = flipped[:, [ri, li], :]
+    #         variants.append(flipped)
+
+    #     # 時間反転（逆順）
+    #     if TTA_TEMPORAL_ENABLED:
+    #         rev = seq_norm[::-1].copy()
+    #         variants.append(rev)
+
+    #         # 逆順＋左右反転（両方ON時のみ）
+    #         if TTA_FLIP_ENABLED:
+    #             rev_flip = rev.copy()
+    #             rev_flip[..., 0] = -rev_flip[..., 0]
+    #             for li, ri in COCO_LR_PAIRS:
+    #                 rev_flip[:, [li, ri], :] = rev_flip[:, [ri, li], :]
+    #             variants.append(rev_flip)
+    #         variants.append(rev)
+
+    #         # 逆順＋左右反転（両方ON時のみ）
+    #         if TTA_FLIP_ENABLED:
+    #             rev_flip = rev.copy()
+    #             rev_flip[..., 0] = -rev_flip[..., 0]
+    #             for li, ri in COCO_LR_PAIRS:
+    #                 rev_flip[:, [li, ri], :] = rev_flip[:, [ri, li], :]
+    #             variants.append(rev_flip)
+
+    #     # 5) 各バリアントを埋め込んで平均
+    #     feats = []
+    #     for v in variants:
+    #         f = _embed_with_optional_noise(v)
+    #         if f is not None:
+    #             feats.append(f)
+
+    #     if not feats:
+    #         return None
+
+    #     feat = np.mean(np.stack(feats, axis=0), axis=0).astype(np.float32, copy=False)
+        
+    #     n = float(np.linalg.norm(feat)) + 1e-12 
+    #     if n > 0:
+    #         feat = feat / n
+            
+    #     return feat
 
     def embed_xy_query_variants(self, xy: np.ndarray) -> list[np.ndarray]:
         """
@@ -716,55 +777,43 @@ class GaitMixerRunner:
         if xy is None or xy.ndim != 3 or xy.shape[1:] != (17, 2):
             return []
 
-        # 設定取得（ローカルimportで後方互換）
-        try:
-            from config import COCO_LR_PAIRS, TTA_FLIP_ENABLED, TTA_NOISE_ENABLED, TTA_TEMPORAL_ENABLED
-        except Exception:
-            COCO_LR_PAIRS = [(5,6),(7,8),(9,10),(11,12),(13,14),(15,16)]
-            try:
-                from config import TTA_FLIP_ENABLED
-            except Exception:
-                TTA_FLIP_ENABLED = False
-            try:
-                from config import TTA_NOISE_ENABLED
-            except Exception:
-                TTA_NOISE_ENABLED = False
-            try:
-                from config import TTA_TEMPORAL_ENABLED
-            except Exception:
-                TTA_TEMPORAL_ENABLED = False
-
-        # 1) 正規化（方法B）
-        seq_norm = self.gutils.normalize_pose(xy)  # (T,17,2)
-
-        # 2) 単発埋め込み
+        xy = np.asarray(xy, dtype=np.float32)
+        # 1) 単発埋め込み
+        #    embed_sequence 内部で:
+        #      - (T,K,C) → (T,17,2) への成形確認
+        #      - _embed_xy_sequence → normalize_pose_with_weighting → resample32 → model
+        #    というパイプラインに統一されている想定。
         def _embed_once(a_xy: np.ndarray) -> np.ndarray | None:
             return self.embed_sequence(a_xy)  # (T,17,2) 受け
 
-        # 3) ノイズTTA（有効時のみ平均）
+        # 2) ノイズTTA（有効時のみ平均）
         def _embed_with_optional_noise(a_xy: np.ndarray) -> np.ndarray | None:
             if TTA_NOISE_ENABLED:
+                # noise_tta_embed のインターフェースは従来通り:
+                #   seq(任意)と embed_func(seq)->feat を受け取り、ノイズ付き平均を返す
                 return self.gutils.noise_tta_embed(a_xy, _embed_once)
             out = _embed_once(a_xy)
             return np.asarray(out, dtype=np.float32).reshape(-1) if out is not None else None
 
-        # 4) バリアント生成（設定に忠実）
+        # 3) バリアント生成（設定に忠実）
         variants: list[np.ndarray] = []
 
-        # 原
-        variants.append(seq_norm)
+        # 原系列（未正規化）
+        variants.append(xy)
 
         # flip
         if TTA_FLIP_ENABLED:
-            flipped = seq_norm.copy()
+            flipped = xy.copy()
+            # x 座標の符号反転
             flipped[..., 0] = -flipped[..., 0]
+            # 左右ジョイントの入れ替え（COCO_LR_PAIRS に依存）
             for li, ri in COCO_LR_PAIRS:
                 flipped[:, [li, ri], :] = flipped[:, [ri, li], :]
             variants.append(flipped)
 
-        # rev
+        # rev（時間反転）
         if TTA_TEMPORAL_ENABLED:
-            rev = seq_norm[::-1]
+            rev = xy[::-1].copy()
             variants.append(rev)
 
             # rev+flip（両方ONのときのみ）
@@ -775,7 +824,7 @@ class GaitMixerRunner:
                     rev_flip[:, [li, ri], :] = rev_flip[:, [ri, li], :]
                 variants.append(rev_flip)
 
-        # 5) 各バリアントを埋め込み
+        # 4) 各バリアントを埋め込み
         feats: list[np.ndarray] = []
         for v in variants:
             f = _embed_with_optional_noise(v)
@@ -793,3 +842,35 @@ class GaitMixerRunner:
         cur = int(len(self.seq_buffer)) if hasattr(self, "seq_buffer") else 0
         total = 32  # モデルの学習窓
         return cur, total
+    
+    def _apply_velocity_augmentation(self, kpts_norm: np.ndarray) -> np.ndarray:
+        """
+        正規化済みの (T,17,2) 座標列に対して、
+        時間差分 Δxy を用いた簡易な速度特徴を混ぜ込む。
+
+        - 先頭フレームの Δ は 0
+        - GAIT_VEL_AUG_ENABLED=False の場合は素通し
+        - new = kpts_norm + α * Δ （α=GAIT_VEL_AUG_ALPHA）
+
+        返り値:
+            (T,17,2) の numpy 配列
+        """
+        if not GAIT_VEL_AUG_ENABLED:
+            return kpts_norm
+
+        if kpts_norm is None or kpts_norm.ndim != 3 or kpts_norm.shape[1:] != (17, 2):
+            return kpts_norm
+
+        T = kpts_norm.shape[0]
+        if T <= 1:
+            return kpts_norm
+
+        kpts_norm = np.asarray(kpts_norm, dtype=np.float32)
+
+        # Δxy を計算（先頭は 0）
+        delta = np.zeros_like(kpts_norm, dtype=np.float32)
+        delta[1:] = kpts_norm[1:] - kpts_norm[:-1]
+
+        alpha = float(GAIT_VEL_AUG_ALPHA)
+        out = kpts_norm + alpha * delta
+        return out.astype(np.float32, copy=False)
