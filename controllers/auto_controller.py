@@ -60,6 +60,7 @@ try:
         # ランキングデフォルト閾値
         AUTO_FACE_THRESH_DEFAULT, AUTO_APP_THRESH_DEFAULT, AUTO_GAIT_THRESH_DEFAULT,
         AUTO_FACE_PRI_THRESH_DEFAULT, AUTO_APP_PRI_THRESH_DEFAULT, AUTO_GAIT_PRI_THRESH_DEFAULT,
+        AUTO_FACE_REJECT_THRESH_DEFAULT, AUTO_APP_REJECT_THRESH_DEFAULT, AUTO_GAIT_REJECT_THRESH_DEFAULT, 
         # トラッカー
         BYTE_TRACK_ENABLED,
         BYTE_TRACK_TRACK_THRESH, BYTE_TRACK_HIGH_THRESH,
@@ -142,6 +143,11 @@ class AutoController(QObject):
         self._face_pri_thresh: float = float(AUTO_FACE_PRI_THRESH_DEFAULT)
         self._app_pri_thresh: float = float(AUTO_APP_PRI_THRESH_DEFAULT)
         self._gait_pri_thresh: float = float(AUTO_GAIT_PRI_THRESH_DEFAULT)
+        
+        # ランキング完全除外用の下限閾値（0 以下なら無効）
+        self._face_reject_thresh: float = float(AUTO_FACE_REJECT_THRESH_DEFAULT)
+        self._app_reject_thresh:  float = float(AUTO_APP_REJECT_THRESH_DEFAULT)
+        self._gait_reject_thresh: float = float(AUTO_GAIT_REJECT_THRESH_DEFAULT)
 
         # 検出器
         self.face_det: Optional[YOLOFaceDetector] = None
@@ -3173,6 +3179,28 @@ class AutoController(QObject):
             if np.isnan(f):
                 return None
             return f
+        
+        # 完全除外閾値チェック（このトラック自体をランキング対象から外す）
+        hard_reject: list[bool] = [False] * n_boxes
+
+        use_face_reject = self._face_reject_thresh > 0.0
+        use_app_reject  = self._app_reject_thresh  > 0.0
+        use_gait_reject = self._gait_reject_thresh > 0.0
+
+        if use_face_reject or use_app_reject or use_gait_reject:
+            for i in range(n_boxes):
+                f = _valid(sim_face_avg[i])
+                a = _valid(sim_app_avg[i])
+                g = _valid(sim_gait_avg[i])
+
+                # ★ 仕様：どれか1つでも「非常に低い」と判定されたら、
+                #   そのトラックはどの識別方法のランキングにも載せない
+                if (
+                    (use_face_reject and f is not None and f < self._face_reject_thresh)
+                    or (use_app_reject and a is not None and a < self._app_reject_thresh)
+                    or (use_gait_reject and g is not None and g < self._gait_reject_thresh)
+                ):
+                    hard_reject[i] = True
 
         # それぞれの識別方法ごとに
         #   1. 閾値未満を除外
@@ -3184,6 +3212,10 @@ class AutoController(QObject):
         scored_gait: list[tuple[int, float]] = []
 
         for i in range(n_boxes):
+            # ★ Reject 閾値に引っかかったトラックは、どのモダリティでも使わない
+            if hard_reject[i]:
+                continue
+
             f = _valid(sim_face_avg[i])
             if f is not None and f > float(self._face_thresh):
                 scored_face.append((i, f))
@@ -3205,7 +3237,7 @@ class AutoController(QObject):
             scored_app  = scored_app[:maxN]
             scored_gait = scored_gait[:maxN]
             
-                # 優先（ハイ）閾値による hi / lo 分割
+        # 優先（ハイ）閾値による hi / lo 分割
         def _split_hi_lo(
             scored_list: list[tuple[int, float]],
             pri: Optional[float],
@@ -3236,30 +3268,6 @@ class AutoController(QObject):
 
 
         # TrackID（または index）ごとに重複を除外するためのキー
-        used_track_keys: set[int] = set()
-
-        def _track_key_for_index(idx: int) -> int:
-            if self._track_ids_pose is None:
-                return idx
-            try:
-                tid = int(self._track_ids_pose[idx])
-            except Exception:
-                return idx
-            return tid if tid >= 0 else idx
-
-        def _make_entry(idx: int, used_modality: str) -> RankEntry:
-            f = _valid(sim_face_avg[idx])
-            a = _valid(sim_app_avg[idx])
-            g = _valid(sim_gait_avg[idx])
-            return RankEntry(
-                index=idx,
-                rank=0,  # このあとブロック順に 1,2,3... を振る
-                used_modality=used_modality,
-                face_sim=f,
-                app_sim=a,
-                gait_sim=g,
-            )
-
         used_track_keys: set[int] = set()
 
         def _track_key_for_index(idx: int) -> int:
