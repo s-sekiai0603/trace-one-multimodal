@@ -48,6 +48,8 @@ try:
         AUTO_GALLERY_DIR,
         # 骨格
         POSE_DRAW_LANDMARK_BGR, POSE_DRAW_CONNECTION_BGR, POSE_DRAW_THICKNESS, POSE_DRAW_RADIUS, POSE_KPT_CONF_MIN,
+        # 頭部
+        COCO_IDX_LEFT_EYE, COCO_IDX_RIGHT_EYE, COCO_IDX_LEFT_EAR,COCO_IDX_RIGHT_EAR,
         # OSNet
         OSNET_MODEL_PATH, OSNET_INPUT_SIZE_HW,
         # Gait
@@ -95,6 +97,7 @@ from ..embedders.gait_mixer import GaitMixerRunner
 from ..utils.auto_ranker import AutoRanker, RankEntry
 from ..utils.auto_report_html import AutoHtmlReportBuilder, ReportSnapshot, ReportItem
 from ..utils.evidence_capture import EvidenceCapture
+from ..utils.auto_plot import AutoPlotManager
 
 # OSNet は Identifier風の実装になっているため薄いラッパが必要な場合があります
 from ..embedders.osnet import cosine_sim as cos_sim
@@ -251,7 +254,7 @@ class AutoController(QObject):
         
         self._fps = FPS
         
-        # ★ 2秒ごとのキャプチャ用
+        #  2秒ごとのキャプチャ用
         #   FPS=30 の場合 → 2秒 = 60フレームごとに保存
         interval_frames = int(self._fps * 2)
         self._evidence_capture = EvidenceCapture(
@@ -262,6 +265,9 @@ class AutoController(QObject):
             ext=".png",
         )
         self._capture_frame_idx = 0  # 識別ON中のフレームカウンタ
+        
+        # 類似度プロット管理（顔 / 外見 / 歩容）
+        self._plot_mgr: Optional[AutoPlotManager] = None
 
         # シグナル購読
         self.win.frameAvailable.connect(self.on_frame)
@@ -294,7 +300,6 @@ class AutoController(QObject):
             if not s:
                 raise ValueError("empty label")
 
-            import re, json, os
             # 1) ラベル解析： base + [ - <prefix?><digits> ]
             #    例:
             #      'Mizuta-P0003' → base='Mizuta', prefix='P', num='0003'
@@ -382,21 +387,80 @@ class AutoController(QObject):
             self._label_seq    = int(numstr)
             self._target_label = full
 
-            # 5) ギャラリー読み込み（face/app/gait）
+            # 統合ギャラリーのパス
+            face_fused_json = os.path.join(AUTO_GALLERY_DIR, "face_fused_gallery.json")
+            app_fused_json  = os.path.join(AUTO_GALLERY_DIR, "app_fused_gallery.json")
+            gait_fused_json = os.path.join(AUTO_GALLERY_DIR, "gait_fused_gallery.json")
+
+            def _concat_vecs(a, b):
+                """
+                2つの (N,D) / (D,) / None を安全に結合して (N,D) にするヘルパ。
+                どちらかが None の場合は片方だけ返す。
+                """
+                if a is None and b is None:
+                    return None
+                if a is None:
+                    return b
+                if b is None:
+                    return a
+                try:
+                    aa = np.asarray(a, np.float32)
+                    bb = np.asarray(b, np.float32)
+                    if aa.ndim == 1:
+                        aa = aa.reshape(1, -1)
+                    if bb.ndim == 1:
+                        bb = bb.reshape(1, -1)
+                    return np.concatenate([aa, bb], axis=0)
+                except Exception:
+                    # どちらかが想定外の形でも既存分だけは使えるようにする
+                    return a
+
+            # --- 顔 ---
             try:
-                self._gallery_face = self._load_label_vecs_from_json(AUTO_FACE_JSON, full)
+                base_face  = self._load_label_vecs_from_json(AUTO_FACE_JSON, full)
+                fused_face = self._load_label_vecs_from_json(face_fused_json, full)
+                self._gallery_face = _concat_vecs(base_face, fused_face)
             except Exception:
                 self._gallery_face = None
+
+            # --- 外見 ---
             try:
-                self._gallery_app  = self._load_label_vecs_from_json(AUTO_APP_JSON,  full)
-            except Exception:
-                self._gallery_app  = None
+                base_app  = self._load_label_vecs_from_json(AUTO_APP_JSON, full)
+                fused_app = self._load_label_vecs_from_json(app_fused_json, full)
+                self._gallery_app = _concat_vecs(base_app, fused_app)
+                
+                self.log.info(
+                    "[AUTO][GALLERY-RAW][app] label=%s base=%s fused=%s final=%s",
+                    full,
+                    None if base_app is None else base_app.shape,
+                    None if fused_app is None else fused_app.shape,
+                    None if self._gallery_app is None else self._gallery_app.shape,
+                )
+            except Exception as e:
+                self._gallery_app = None
+                self.log.exception("[AUTO][GALLERY-ERR][app] label=%s: %s", full, e)
+
+            # --- 歩容 ---
             try:
-                self._gallery_gait = self._load_label_vecs_from_json(AUTO_GAIT_JSON, full)
+                base_gait  = self._load_label_vecs_from_json(AUTO_GAIT_JSON, full)
+                fused_gait = self._load_label_vecs_from_json(gait_fused_json, full)
+                self._gallery_gait = _concat_vecs(base_gait, fused_gait)
             except Exception:
                 self._gallery_gait = None
-                
+
+            # 向き別マップ（顔：pose / 歩容：view）
             self._gallery_face_by_pose = self._load_face_gallery_by_pose(full)
+            try:
+                self._gallery_gait_by_view = self._load_gait_gallery_by_view(full)
+            except Exception:
+                self._gallery_gait_by_view = {}
+
+            # 6) ログ
+            ok_face = "OK" if (self._gallery_face is not None) else "None"
+            ok_app  = "OK" if (self._gallery_app  is not None) else "None"
+            ok_gait = "OK" if (self._gallery_gait is not None) else "None"
+            self.log.info("[AUTO] target_label=%s  (base=%s, prefix=%s, seq=%s)", full, base, prefix, numstr)
+            self.log.info("[AUTO][GALLERY] face=%s, appearance=%s, gait=%s", ok_face, ok_app, ok_gait)
 
             # 6) ログ
             ok_face = "OK" if (self._gallery_face is not None) else "None"
@@ -547,7 +611,7 @@ class AutoController(QObject):
             self.sel_face_idx = self.sel_pose_idx = None
             self._reprocess_last_frame()
         else:
-            # ★ 特徴学習OFFになったときは選択状態をクリアして赤枠を消す
+            #  特徴学習OFFになったときは選択状態をクリアして赤枠を消す
             self.sel_face_idx = self.sel_pose_idx = None
             try:
                 self._reprocess_last_frame()
@@ -589,7 +653,7 @@ class AutoController(QObject):
             self._hi_gait_idx = None
             self.log.info("[AUTO] 識別: ON（UI描画なし・ログ出力のみ）")
 
-            # ★ HTMLレポート用のセッションを初期化
+            # HTMLレポート用のセッションを初期化
             self._auto_report_frame_counter = 0
             self._auto_report_snapshots = []
             try:
@@ -603,17 +667,39 @@ class AutoController(QObject):
                 show_sim=AUTO_REPORT_SHOW_SIM,
             )
             self._auto_report_builder.set_video_name(self._get_video_filename())
+            
+            try:
+                # 初回なら作成、2回目以降は video_time_label だけ更新
+                if self._plot_mgr is None:
+                    self._plot_mgr = AutoPlotManager(
+                        enabled=True,
+                        video_time_label=self._get_video_time_label(),  # "MM:SS"
+                    )
+                else:
+                    self._plot_mgr.video_time_label = self._get_video_time_label()
+
+                self._plot_mgr.start_session()
+                self.log.info("[AUTO][PLOT] start new plot session")
+            except Exception as e:
+                self.log.exception("[AUTO][PLOT] start_session failed: %s", e)
 
             self._reprocess_last_frame()
 
         else:
-            # ★ OFFになった瞬間にHTMLレポート確定
+            #  OFFになった瞬間にHTMLレポート確定
             self.log.info("[AUTO][REPORT] 識別OFF → レポートを確定します")
             self._capture_frame_idx = 0
             try:
                 self._finalize_auto_report()
             except Exception as e:
                 self.log.exception("[AUTO][REPORT] finalize failed: %s", e)
+                
+            try:
+                if self._plot_mgr is not None:
+                    self._plot_mgr.finalize()
+                    self.log.info("[AUTO][PLOT] finalize plot session")
+            except Exception as e:
+                self.log.exception("[AUTO][PLOT] finalize failed: %s", e)
                 
     @Slot(object)
     def on_frame(self, frame_bgr: np.ndarray):
@@ -717,6 +803,12 @@ class AutoController(QObject):
                     self._capture_topN_snapshot()
             except Exception as e:
                 self.log.exception("[AUTO] capture_topN_snapshot failed: %s", e)
+            
+            # --- 類似度プロット更新（顔 / 外見 / 歩容）--- 
+            try:
+                self._update_similarity_plots_for_frame()
+            except Exception as e:
+                self.log.exception("[AUTO][PLOT] update_similarity_plots failed: %s", e)
 
         # --- 特徴学習（選択ありのときのみ） ---
         if self.feat_on and self._has_selection():
@@ -826,13 +918,14 @@ class AutoController(QObject):
                 self._mean(self._buf_app),
             )
 
-            # 歩容: 向き別バッファがあれば view ごとに保存、無ければ従来通り
+            # 歩容: まず dir8（8方向）を優先して保存し、
+            # なければ従来の front/back/side or label_to_vecs を使う
             gait_path = os.path.join(AUTO_GALLERY_DIR, "gait_gallery.json")
             
             buf_dir8 = getattr(self, "_buf_gait_dir8", {}) or {}
-            
+
             if buf_dir8:
-                # dir8 ごとに平均して保存
+                # --- dir8 ごとに平均して保存（新形式） ---
                 for dir8, vecs in buf_dir8.items():
                     if not vecs:
                         continue
@@ -846,8 +939,8 @@ class AutoController(QObject):
                     ",".join(sorted(buf_dir8.keys())),
                 )
 
-            if AUTO_GAIT_YAW_ENABLED:
-                # 安全のため getattr で取得（まだ属性がなければ空リスト扱い）
+            elif AUTO_GAIT_YAW_ENABLED:
+                # --- dir8 が無く、かつ view(front/back/side) がある場合のみ ---
                 buf_front = getattr(self, "_buf_gait_front", []) or []
                 buf_back  = getattr(self, "_buf_gait_back",  []) or []
                 buf_side  = getattr(self, "_buf_gait_side",  []) or []
@@ -868,6 +961,11 @@ class AutoController(QObject):
                     if side_vec is not None:
                         self._append_gait_view_json(gait_path, label, "side", side_vec)
 
+                    self.log.info(
+                        "[AUTO][SAVE] 保存完了: %s (face/app/gait-view, face_vecs=%d)",
+                        label, len(self._buf_face),
+                    )
+
                 else:
                     # まだ向き別学習をしていない古いデータ用に、従来形式も維持
                     self._append_json(
@@ -875,15 +973,21 @@ class AutoController(QObject):
                         label,
                         self._mean(self._buf_gait),
                     )
-
+                    self.log.info(
+                        "[AUTO][SAVE] 保存完了: %s (face/app/gait-legacy, face_vecs=%d)",
+                        label, len(self._buf_face),
+                    )
+            else:
+                # AUTO_GAIT_YAW_ENABLED=False で dir8 も無い場合は、従来通り label_to_vecs のみ
+                self._append_json(
+                    gait_path,
+                    label,
+                    self._mean(self._buf_gait),
+                )
                 self.log.info(
-                    "[AUTO][SAVE] 保存完了: %s (face/app/gait, face_vecs=%d)",
+                    "[AUTO][SAVE] 保存完了: %s (face/app/gait-legacy, face_vecs=%d)",
                     label, len(self._buf_face),
                 )
-                
-            else:
-                # yaw OFF のときは常に従来形式
-                self._append_json(gait_path, label, self._mean(self._buf_gait))
         except Exception as e:
             self.log.exception("[AUTO][SAVE] JSON 追記に失敗しました: %s", e)
 
@@ -975,7 +1079,7 @@ class AutoController(QObject):
         # 歩容
         if self.gait_embed is not None:
             k = None
-            # ★ sel_pose_idx と _kpts_pose の両方を安全にチェック
+            #  sel_pose_idx と _kpts_pose の両方を安全にチェック
             if self._kpts_pose is not None and self.sel_pose_idx is not None:
                 idx = int(self.sel_pose_idx)
                 if 0 <= idx < len(self._kpts_pose):
@@ -993,7 +1097,7 @@ class AutoController(QObject):
                 self._gait_seq.append(np.asarray(k, np.float32))  # (17,3)
                 seq_len = len(self._gait_seq)
 
-                # --- ★ 30〜32フレームだけ 8方向ログ ---
+                # ---  30〜32フレームだけ 8方向ログ ---
                 self._maybe_log_gait_dir8_learning(k, seq_len)
 
                 # --- gait api 初期化 ---
@@ -1012,7 +1116,26 @@ class AutoController(QObject):
                         # 全体バッファに保存
                         self._buf_gait.append(gv)
 
-                        # 向き別バッファ（MediaPipe Yaw）
+                        #  dir8（8方向）バッファに保存 
+                        try:
+                            dir8 = self._decide_gait_seq_dir8()
+                        except Exception:
+                            dir8 = None
+                        if dir8:
+                            # 初期化されていない場合に備えて getattr 経由
+                            buf_dir8 = getattr(self, "_buf_gait_dir8", None)
+                            if buf_dir8 is None:
+                                buf_dir8 = {}
+                                self._buf_gait_dir8 = buf_dir8
+                            buf_dir8.setdefault(str(dir8), []).append(gv)
+
+                            self.log.info(
+                                "[AUTO][GAIT][DIR8] learned 1 seq (T=%d, dir8=%s)",
+                                seq_len,
+                                dir8,
+                            )
+
+                        # 向き別バッファ（MediaPipe Yaw）※既存仕様は残すが、dir8とは独立
                         if AUTO_GAIT_YAW_ENABLED:
                             yaw = None
                             yaw_list = getattr(self, "_pose_yaws", None)
@@ -1142,10 +1265,15 @@ class AutoController(QObject):
             if vecs is None:
                 return None
             v = np.asarray(vecs, np.float32)
-            if v.ndim == 2 and v.shape[0] > 1:
+
+            # --- 互換性維持しつつ外見だけ救済 ---
+            # (1,D) だったら mean(axis=0) と同じ結果にする
+            if v.ndim == 2:
                 v = v.mean(axis=0)
+
             if v.ndim != 1:
                 return None
+
             v /= (np.linalg.norm(v) + 1e-12)
             return v.astype(np.float32)
 
@@ -1183,7 +1311,7 @@ class AutoController(QObject):
                     for i in range(feats.shape[0]):
                         f = feats[i]
                         pose_i = self._pose_for_face_index(i)  # そのBBOXの向き
-                        g_i = self._pick_gallery_vec_for_pose(pose_i, pose_map, g_face_centroid)
+                        g_i = self._pick_gallery_vec_for_pose(pose_i, pose_map, g_face_centroid, q_vec=f,)
                         if g_i is None or g_i.ndim != 1 or g_i.size != f.size:
                             continue
                         s = float(np.dot(f, g_i))
@@ -1314,6 +1442,7 @@ class AutoController(QObject):
                                         need_dir8=used_dir8,
                                         dir8_map=gallery_view_map,
                                         default_vec=gallery_default,
+                                        q_vec=gv,
                                     )
 
                             # --- ② dir8 でギャラリーが取れなかった場合、従来どおり yaw→view にフォールバック ---
@@ -1330,6 +1459,7 @@ class AutoController(QObject):
                                     need_view,
                                     gallery_view_map,
                                     gallery_default,
+                                    q_vec=gv,
                                 )
 
                             if gvec is None:
@@ -1401,7 +1531,7 @@ class AutoController(QObject):
         現フレームの TrackID / 類似度から、
         TrackIDごとの統計（Face/App/Gait）を更新する。
 
-        ★ ポイント：
+         ポイント：
         すべて「Pose側のTrackID」をキーとして集約する。
         顔SIMも Poseインデックス -> Pose TrackID に紐付ける。
         """
@@ -1541,7 +1671,7 @@ class AutoController(QObject):
                     face_sim, app_sim, gait_sim = self._get_similarity_for_pose(i)
                     self._draw_similarity_text(img, box, face_sim, app_sim, gait_sim)
                     
-                # ★ MediaPipe Pose の yaw から向きラベルを描画（属性名を _pose_yaws に統一）
+                #  MediaPipe Pose の yaw から向きラベルを描画（属性名を _pose_yaws に統一）
                 # yaw_deg_list = getattr(self, "_pose_yaws", None)
                 # view_txt = None
                 # if yaw_deg_list is not None and i < len(yaw_deg_list):
@@ -1766,40 +1896,151 @@ class AutoController(QObject):
 
     def _update_face_link_for_selected_pose(self):
         """
-        sel_pose_idx で選択中のPose BBOXに内包されるFace BBOXインデックスを1つだけ紐付ける。
-        検出数の変化で sel_pose_idx が範囲外になっていた場合は選択をクリアして終了する。
+        sel_pose_idx で選択中の Pose に対応する Face BBOX をひとつ紐付ける。
+        互換性を保ちつつ、まず骨格ベース（耳＋同側の目）から head_box を生成して
+        head_box 内の Face を優先的に採用する。
+        失敗した場合は従来の「Pose BBOX 内包」ロジックにフォールバックする。
         """
         self.sel_face_idx = None
-        if self.sel_pose_idx is None or self._boxes_pose is None or self._boxes_face is None:
+
+        if (
+            self.sel_pose_idx is None
+            or self._boxes_pose is None
+            or self._boxes_face is None
+        ):
             return
 
-        # ★ 検出数の変化などで sel_pose_idx が範囲外なら選択をリセット
         idx = int(self.sel_pose_idx)
+
+        #  検出数変動で idx が範囲外なら、従来通り選択解除
         if idx < 0 or idx >= len(self._boxes_pose):
             self.sel_pose_idx = None
             self._sel_pose_prev = None
             return
 
+        # -------------------------------------------------------
+        # ① 骨格から head_box を作成（耳＋同側の目）
+        # -------------------------------------------------------
+        head_box = None
+        if (
+            self._kpts_pose is not None
+            and 0 <= idx < len(self._kpts_pose)
+        ):
+            try:
+                head_box = self._compute_head_box(self._kpts_pose[idx])
+            except Exception:
+                head_box = None
+
+        # -------------------------------------------------------
+        # ② head_box があれば、Face を「最も頭に近い」ものに紐付け
+        # -------------------------------------------------------
+        if head_box is not None:
+            hx1, hy1, hx2, hy2 = head_box
+            hcx = (hx1 + hx2) * 0.5
+            hcy = (hy1 + hy2) * 0.5
+
+            best_i = None
+            best_d2 = None
+
+            for fi, fb in enumerate(self._boxes_face):
+                fx1, fy1, fx2, fy2 = fb
+                fcx = (fx1 + fx2) * 0.5
+                fcy = (fy1 + fy2) * 0.5
+
+                # 顔中心が head_box 内にある場合のみ採用
+                if not (hx1 <= fcx <= hx2 and hy1 <= fcy <= hy2):
+                    continue
+
+                dx = fcx - hcx
+                dy = fcy - hcy
+                d2 = dx * dx + dy * dy
+
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+                    best_i = fi
+
+            if best_i is not None:
+                self.sel_face_idx = best_i
+                return  #  骨格で決まったので、従来処理は不要
+
+        # -------------------------------------------------------
+        # ③ 骨格で拾えなければ従来ロジック（完全互換）
+        # -------------------------------------------------------
         pb = self._boxes_pose[idx]
-        for i, fb in enumerate(self._boxes_face):
+        for fi, fb in enumerate(self._boxes_face):
             if self._is_inside(fb, pb):
-                self.sel_face_idx = i
+                self.sel_face_idx = fi
                 break
             
     def _update_face_links_all(self):
-        """各Pose BBOXに含まれるFace BBOXインデックスを記録（類似度描画用）"""
+        """
+        各 Pose に紐づく Face インデックスを配列で持つ。
+        従来（Pose BBOX 内包）方式は維持しつつ、
+        まず骨格ベースの head_box を使って Face を探す。
+        """
         self._pose_face_index = None
+
         if self._boxes_pose is None or self._boxes_face is None:
             return
 
         links: List[Optional[int]] = [None] * len(self._boxes_pose)
+
         for pi, pb in enumerate(self._boxes_pose):
-            for fi, fb in enumerate(self._boxes_face):
-                if self._is_inside(fb, pb):
-                    links[pi] = fi
-                    break
+
+            best_fi = None
+
+            # -------------------------------------------------------
+            # ① まず骨格から head_box を取得
+            # -------------------------------------------------------
+            head_box = None
+            if (
+                self._kpts_pose is not None
+                and 0 <= pi < len(self._kpts_pose)
+            ):
+                try:
+                    head_box = self._compute_head_box(self._kpts_pose[pi])
+                except Exception:
+                    head_box = None
+
+            # -------------------------------------------------------
+            # ② head_box がある場合、Face を「最も頭に近い」候補で選択
+            # -------------------------------------------------------
+            if head_box is not None:
+                hx1, hy1, hx2, hy2 = head_box
+                hcx = (hx1 + hx2) * 0.5
+                hcy = (hy1 + hy2) * 0.5
+
+                best_d2 = None
+
+                for fi, fb in enumerate(self._boxes_face):
+                    fx1, fy1, fx2, fy2 = fb
+                    fcx = (fx1 + fx2) * 0.5
+                    fcy = (fy1 + fy2) * 0.5
+
+                    if not (hx1 <= fcx <= hx2 and hy1 <= fcy <= hy2):
+                        continue
+
+                    dx = fcx - hcx
+                    dy = fcy - hcy
+                    d2 = dx * dx + dy * dy
+
+                    if best_d2 is None or d2 < best_d2:
+                        best_d2 = d2
+                        best_fi = fi
+
+            # -------------------------------------------------------
+            # ③ 骨格で見つからない時は従来ロジックにフォールバック
+            # -------------------------------------------------------
+            if best_fi is None:
+                for fi, fb in enumerate(self._boxes_face):
+                    if self._is_inside(fb, pb):
+                        best_fi = fi
+                        break
+
+            links[pi] = best_fi
 
         self._pose_face_index = links
+
 
     @staticmethod
     def _is_inside(inner: np.ndarray, outer: np.ndarray) -> bool:
@@ -2013,103 +2254,64 @@ class AutoController(QObject):
         )
 
     def _load_auto_label_vectors(self, label: str) -> None:
-        def _norm(v):
-            v = np.asarray(v, np.float32)
-            if v.ndim == 2:  # 複数なら平均
-                v = v.mean(axis=0)
-            n = float(np.linalg.norm(v) + 1e-12)
-            return (v / n).astype(np.float32)
+        """
+        AUTO識別時の遅延ロード用ヘルパ。
 
-        def _pick_from_record(rec: dict, want_label: str):
-            """
-            1レコードからベクトルを取り出すユーティリティ。
-            label/pid/name のいずれか一致→ vec/feature/emb/centroid/vecs/features から取り出し。
-            """
-            key = str(rec.get("label") or rec.get("pid") or rec.get("name") or "")
-            if key != want_label:
-                return None
-            # 単体ベクトル候補
-            for k in ("vec", "feature", "emb", "centroid"):
-                if k in rec and rec[k] is not None:
-                    return _norm(rec[k])
-            # 複数ベクトル候補（平均化）
-            for k in ("vecs", "features", "embs"):
-                if k in rec and rec[k]:
-                    return _norm(rec[k])
-            return None
+        役割:
+        - self._target_label を更新
+        - face/app/gait 各ギャラリーのベクトルを再ロード
+        - pose別・dir8/view別のギャラリーマップも再構築
 
-        def _read_one_vec(json_path: str, want_label: str):
-            try:
-                if not json_path or not os.path.exists(json_path):
-                    return None
-                with open(json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+        実処理は set_target_label() に一本化している。
+        """
+        # ラベルの正規化
+        label = (label or "").strip()
 
-                # 1) 辞書スタイルの代表的スキーマ
-                if isinstance(data, dict):
-                    # label_to_vecs / pid_to_vecs
-                    for map_key in ("label_to_vecs", "pid_to_vecs", "name_to_vecs"):
-                        if map_key in data and isinstance(data[map_key], dict):
-                            vecs = data[map_key].get(want_label)
-                            if vecs is not None:
-                                return _norm(vecs)
+        if not label:
+            # ラベルが空なら各ギャラリーをクリアして終了
+            self._target_label = ""
+            self._label_base = ""
+            self._label_prefix = ""
+            self._label_seq = 0
 
-                    # *_to_centroid
-                    for map_key in ("label_to_centroid", "pid_to_centroid", "name_to_centroid"):
-                        if map_key in data and isinstance(data[map_key], dict):
-                            vec = data[map_key].get(want_label)
-                            if vec is not None:
-                                return _norm(vec)
+            self._gallery_face = None
+            self._gallery_app  = None
+            self._gallery_gait = None
 
-                    # records配列を内包する形 {"records":[{...}, ...]}
-                    if "records" in data and isinstance(data["records"], list):
-                        for rec in data["records"]:
-                            if isinstance(rec, dict):
-                                v = _pick_from_record(rec, want_label)
-                                if v is not None:
-                                    return v
+            # pose / view / dir8 などのマップもクリア
+            self._gallery_face_by_pose = {}
+            self._gallery_gait_by_view = {}
+            return
 
-                # 2) 配列スタイル [{label/pid: "...", vec/feature/...: ...}, ...]
-                if isinstance(data, list):
-                    for rec in data:
-                        if isinstance(rec, dict):
-                            v = _pick_from_record(rec, want_label)
-                            if v is not None:
-                                return v
+        try:
+            # ここで set_target_label にすべて委譲
+            #   - AUTO_FACE_JSON / AUTO_APP_JSON / AUTO_GAIT_JSON
+            #   - face_fused_gallery.json / app_fused_gallery.json / gait_fused_gallery.json
+            # を横断して、
+            #   self._gallery_face / _gallery_app / _gallery_gait
+            #   self._gallery_face_by_pose / _gallery_gait_by_view
+            # を再構築してくれる
+            self.set_target_label(label)
 
-                return None
-            except Exception as e:
-                self.log.exception("[AUTO][GALLERY] load failed: %s (%s)", json_path, e)
-                return None
+            # set_target_label() 内で
+            #   [AUTO] target_label=...
+            #   [AUTO][GALLERY] face=..., appearance=..., gait=...
+            # のログをすでに出しているので、
+            # ここで追加ログは不要。
 
-        face_json = AUTO_FACE_JSON
-        app_json  = AUTO_APP_JSON
-        gait_json = AUTO_GAIT_JSON
+        except Exception as e:
+            # 失敗時はギャラリーを安全側にリセット
+            self.log.exception("[AUTO][_load_auto_label_vectors] failed: %s", e)
 
-        gf = _read_one_vec(face_json,  label)
-        ga = _read_one_vec(app_json,   label)
-        gg = _read_one_vec(gait_json,  label)
+            self._gallery_face = None
+            self._gallery_app  = None
+            self._gallery_gait = None
 
-        self._gallery_face = gf
-        self._gallery_app  = ga
-        self._gallery_gait = gg
-
-        # 歩容：view 別のギャラリーベクトルも読み込み
-        if AUTO_GAIT_YAW_ENABLED:
-            try:
-                self._gallery_gait_by_view = self._load_gait_gallery_by_view(label)
-            except Exception:
-                self._gallery_gait_by_view = {}
-        else:
+            # pose / view / dir8 などもクリアしておく
+            self._gallery_face_by_pose = {}
             self._gallery_gait_by_view = {}
 
-        self.log.info(
-            "[AUTO][GALLERY] loaded: face=%s, appearance=%s, gait=%s, gait_views=%s",
-            "OK" if gf is not None else "None",
-            "OK" if ga is not None else "None",
-            "OK" if gg is not None else "None",
-            sorted(list(self._gallery_gait_by_view.keys())) if self._gallery_gait_by_view else "(none)",
-        )
+
 
     def _reset_runtime(self, light: bool = True):
         self._boxes_face = self._scores_face = None
@@ -2127,12 +2329,92 @@ class AutoController(QObject):
             
     def _load_face_gallery_by_pose(self, label: str) -> Dict[str, np.ndarray]:
         """
-        保存形式（records: [{label, pose, vec}]）から、指定labelのpose別ベクトル辞書を作る。
-        同一(label, pose)が複数ある場合は平均→L2正規化。
+        顔ギャラリーを pose 別にまとめたマップを返す。
+
+        優先順位:
+          1. face_fused_gallery.json の
+             label -> pose -> {rep, mean, ...}
+          2. それが無ければ従来どおり AUTO_FACE_JSON の records から
+             pose 別平均ベクトルを作る
         """
         label = (label or "").strip()
+        pose_map: Dict[str, np.ndarray] = {}
+
+        # --- 1) 統合ギャラリー(face_fused_gallery.json) を優先 ---
+        fused_path = os.path.join(AUTO_GALLERY_DIR, "face_fused_gallery.json")
+        try:
+            if fused_path and os.path.isfile(fused_path):
+                with open(fused_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                # パターンA: {"label_to_views": { label: {pose: {"rep": [...], "mean": [...]}, ... } } }
+                views_dict = None
+                if isinstance(data, dict):
+                    if "label_to_views" in data and isinstance(data["label_to_views"], dict):
+                        views_dict = data["label_to_views"].get(label)
+                    elif "labels" in data and isinstance(data["labels"], dict):
+                        views_dict = data["labels"].get(label)
+
+                if isinstance(views_dict, dict):
+                    tmp: Dict[str, list] = {}
+                    for pose, vinfo in views_dict.items():
+                        if not isinstance(vinfo, dict):
+                            continue
+                        arrs = []
+                        for key in ("rep", "mean", "vec", "centroid"):
+                            v = vinfo.get(key)
+                            if v is None:
+                                continue
+                            vv = np.asarray(v, np.float32).reshape(-1)
+                            if vv.size == 0:
+                                continue
+                            arrs.append(vv)
+                        if arrs:
+                            tmp[pose] = arrs
+
+                    for pose, arrs in tmp.items():
+                        mat = np.stack(arrs, axis=0)
+                        # 行ごとに正規化しておく
+                        n = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+                        pose_map[pose] = (mat / n).astype(np.float32)
+
+                # パターンB: {"records":[{"label":..,"pose":..,"rep":..,"mean":..}, ...]}
+                if not pose_map and isinstance(data, dict) and isinstance(data.get("records"), list):
+                    tmp: Dict[str, list] = {}
+                    for rec in data["records"]:
+                        if not isinstance(rec, dict):
+                            continue
+                        if str(rec.get("label") or "").strip() != label:
+                            continue
+                        pose = str(rec.get("pose") or "").strip()
+                        if not pose:
+                            continue
+
+                        arrs = []
+                        for key in ("rep", "mean", "vec"):
+                            v = rec.get(key)
+                            if v is None:
+                                continue
+                            vv = np.asarray(v, np.float32).reshape(-1)
+                            if vv.size == 0:
+                                continue
+                            arrs.append(vv)
+                        if arrs:
+                            tmp.setdefault(pose, []).extend(arrs)
+
+                    for pose, arrs in tmp.items():
+                        mat = np.stack(arrs, axis=0)
+                        n = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+                        pose_map[pose] = (mat / n).astype(np.float32)
+        except Exception:
+            pose_map = {}
+
+        if pose_map:
+            return pose_map
+
+        # --- 2) 従来どおり AUTO_FACE_JSON の records から pose 別平均を作る ---
         path = AUTO_FACE_JSON
-        pose_map: Dict[str, list] = {}
+        pose_map2: Dict[str, list] = {}
 
         try:
             if not (path and os.path.isfile(path)):
@@ -2142,44 +2424,128 @@ class AutoController(QObject):
         except Exception:
             return {}
 
-        recs = []
+        # 旧: {"records":[{"label":..., "pose":..., "vec":[...]}, ...]}
         if isinstance(data, dict) and isinstance(data.get("records"), list):
-            recs = data["records"]
-        elif isinstance(data, list):
-            recs = data
-        else:
-            # 従来形式のみ（label_to_vecs だけ）の場合は pose別は作れない
-            return {}
+            for rec in data["records"]:
+                if not isinstance(rec, dict):
+                    continue
+                lab = str(rec.get("label") or "").strip()
+                if lab != label:
+                    continue
 
-        for rec in recs:
-            if not isinstance(rec, dict):
-                continue
-            if str(rec.get("label", "")).strip() != label:
-                continue
-            pose = str(rec.get("pose", "")).strip()
-            vec  = rec.get("vec")
-            if not pose or vec is None:
-                continue
-            v = np.asarray(vec, np.float32).reshape(-1)
-            if v.size == 0:
-                continue
-            pose_map.setdefault(pose, []).append(v)
+                pose = str(rec.get("pose") or "").strip()
+                if not pose:
+                    continue
+
+                v = rec.get("vec")
+                if v is None:
+                    continue
+
+                v = np.asarray(v, np.float32).reshape(-1)
+                if v.size == 0:
+                    continue
+
+                pose_map2.setdefault(pose, []).append(v)
 
         out: Dict[str, np.ndarray] = {}
-        for pose, arrs in pose_map.items():
-            m = np.mean(np.stack(arrs, axis=0), axis=0)
-            m /= (np.linalg.norm(m) + 1e-12)
-            out[pose] = m.astype(np.float32)
+        if not pose_map2:
+            return out
+
+        for pose, vecs in pose_map2.items():
+            vv = np.stack(vecs, axis=0).mean(axis=0)
+            n = float(np.linalg.norm(vv) + 1e-12)
+            out[pose] = (vv / n).astype(np.float32)
+
         return out
+
     
     def _load_gait_gallery_by_view(self, label: str) -> Dict[str, np.ndarray]:
         """
-        gait_gallery.json の records から、
-        指定 label の view 別（front/back/side）平均ベクトルを作る。
+        歩容ギャラリーを view 別(front/back/side 等)にまとめたマップを返す。
+
+        優先順位:
+          1. gait_fused_gallery.json の
+             label -> view -> {rep, mean, ...}
+          2. それが無ければ従来どおり AUTO_GAIT_JSON の records から
+             view 別平均ベクトルを作る
         """
         label = (label or "").strip()
+        view_map: Dict[str, np.ndarray] = {}
+
+        # --- 1) 統合ギャラリー(gait_fused_gallery.json) を優先 ---
+        fused_path = os.path.join(AUTO_GALLERY_DIR, "gait_fused_gallery.json")
+        try:
+            if fused_path and os.path.isfile(fused_path):
+                with open(fused_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                # パターンA: {"label_to_views": { label: {view: {"rep": [...], "mean": [...]}, ... } } }
+                views_dict = None
+                if isinstance(data, dict):
+                    if "label_to_views" in data and isinstance(data["label_to_views"], dict):
+                        views_dict = data["label_to_views"].get(label)
+                    elif "labels" in data and isinstance(data["labels"], dict):
+                        views_dict = data["labels"].get(label)
+
+                if isinstance(views_dict, dict):
+                    tmp: Dict[str, list] = {}
+                    for view, vinfo in views_dict.items():
+                        if not isinstance(vinfo, dict):
+                            continue
+                        arrs = []
+                        for key in ("rep", "mean", "vec", "centroid"):
+                            v = vinfo.get(key)
+                            if v is None:
+                                continue
+                            vv = np.asarray(v, np.float32).reshape(-1)
+                            if vv.size == 0:
+                                continue
+                            arrs.append(vv)
+                        if arrs:
+                            tmp[view] = arrs
+
+                    for view, arrs in tmp.items():
+                        mat = np.stack(arrs, axis=0)
+                        n = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+                        view_map[view] = (mat / n).astype(np.float32)
+
+                # パターンB: {"records":[{"label":..,"view":..,"rep":..,"mean":..}, ...]}
+                if not view_map and isinstance(data, dict) and isinstance(data.get("records"), list):
+                    tmp: Dict[str, list] = {}
+                    for rec in data["records"]:
+                        if not isinstance(rec, dict):
+                            continue
+                        if str(rec.get("label") or "").strip() != label:
+                            continue
+                        view = str(rec.get("view") or "").strip()
+                        if not view:
+                            continue
+
+                        arrs = []
+                        for key in ("rep", "mean", "vec"):
+                            v = rec.get(key)
+                            if v is None:
+                                continue
+                            vv = np.asarray(v, np.float32).reshape(-1)
+                            if vv.size == 0:
+                                continue
+                            arrs.append(vv)
+                        if arrs:
+                            tmp.setdefault(view, []).extend(arrs)
+
+                    for view, arrs in tmp.items():
+                        mat = np.stack(arrs, axis=0)
+                        n = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+                        view_map[view] = (mat / n).astype(np.float32)
+        except Exception:
+            view_map = {}
+
+        if view_map:
+            return view_map
+
+        # --- 2) 従来どおり AUTO_GAIT_JSON の records から view 別平均を作る ---
         path = AUTO_GAIT_JSON
-        view_map: Dict[str, list] = {}
+        view_map2: Dict[str, list] = {}
 
         try:
             if not (path and os.path.isfile(path)):
@@ -2189,41 +2555,39 @@ class AutoController(QObject):
         except Exception:
             return {}
 
-        # records を取り出し（dict でも list でも対応）
-        recs = []
         if isinstance(data, dict) and isinstance(data.get("records"), list):
-            recs = data["records"]
-        elif isinstance(data, list):
-            recs = data
-        else:
-            return {}
+            for rec in data["records"]:
+                if not isinstance(rec, dict):
+                    continue
+                lab = str(rec.get("label") or "").strip()
+                if lab != label:
+                    continue
 
-        for rec in recs:
-            if not isinstance(rec, dict):
-                continue
-            if str(rec.get("label", "")).strip() != label:
-                continue
+                view = str(rec.get("view") or "").strip()
+                if not view:
+                    continue
 
-            view = str(rec.get("view", "")).strip().lower()
-            if not view:
-                continue
+                v = rec.get("vec")
+                if v is None:
+                    continue
 
-            v = rec.get("vec")
-            if v is None:
-                continue
-            v = np.asarray(v, np.float32).reshape(-1)
-            n = float(np.linalg.norm(v) + 1e-12)
-            v = v / n
-            view_map.setdefault(view, []).append(v)
+                v = np.asarray(v, np.float32).reshape(-1)
+                if v.size == 0:
+                    continue
 
-        # 各 view ごとに平均して np.ndarray に
+                view_map2.setdefault(view, []).append(v)
+
         out: Dict[str, np.ndarray] = {}
-        for view, vecs in view_map.items():
+        if not view_map2:
+            return out
+
+        for view, vecs in view_map2.items():
             vv = np.stack(vecs, axis=0).mean(axis=0)
             n = float(np.linalg.norm(vv) + 1e-12)
             out[view] = (vv / n).astype(np.float32)
 
         return out
+
 
     def _gait_embed_from_seq(self, seq_kpts: np.ndarray):
         """
@@ -2427,9 +2791,16 @@ class AutoController(QObject):
         self.log.info("[AUTO] target_label(auto-assigned)=%s (base=%s)", full, base)
         return full
     
-    def _load_label_vecs_from_json(path: str, label: str) -> np.ndarray | None:
+    def _load_label_vecs_from_json(self, path: str, label: str) -> np.ndarray | None:
         """
-        保存形式が list/dict/{"label_to_vecs":{...}} のどれでも拾えるように耐性あり。
+        保存形式が
+          - list[dict]
+          - dict["label_to_vecs"]
+          - dict["label_to_views"]      … dir8 / view 別 (gait_fused_gallery.json)
+          - dict["label_to_sources"]    … 外見fused用
+          - dict["records"]             … 汎用record形式
+          - dict[label] = vec/vecs
+        のどれでも拾えるようにしたユーティリティ。
         返り値: (N, D) の numpy 配列（無ければ None）
         """
         if not (path and os.path.isfile(path)):
@@ -2440,40 +2811,124 @@ class AutoController(QObject):
         except Exception:
             return None
 
-        vecs = []
-        # パターン1: {"label_to_vecs": {"Mizuta-P0001":[[...],[...]], ...}}
-        if isinstance(data, dict) and "label_to_vecs" in data and isinstance(data["label_to_vecs"], dict):
-            arr = data["label_to_vecs"].get(label)
-            if isinstance(arr, list):
-                for v in arr:
-                    a = np.asarray(v, dtype=np.float32)
-                    if a.ndim == 1:
-                        vecs.append(a)
-                    elif a.ndim == 2:
-                        vecs.extend([np.asarray(r, dtype=np.float32) for r in a])
-        # パターン2: list of dicts [{"pid":"Mizuta-P0001","vec":[...]}, ...]
+        vecs: list[np.ndarray] = []
+
+        def _push_one(v) -> None:
+            """1本 or 複数のベクトルを vecs に追加する小ヘルパ。"""
+            if v is None:
+                return
+            a = np.asarray(v, dtype=np.float32)
+            if a.ndim == 1:
+                if a.size > 0:
+                    vecs.append(a)
+            elif a.ndim == 2:
+                for r in a:
+                    r = np.asarray(r, dtype=np.float32).reshape(-1)
+                    if r.size > 0:
+                        vecs.append(r)
+
+        # --- dict 形式 ---
+        if isinstance(data, dict):
+            # パターン1: {"label_to_vecs": {"Mizuta-P0001":[[...],[...]], ...}}
+            if "label_to_vecs" in data and isinstance(data["label_to_vecs"], dict):
+                arr = data["label_to_vecs"].get(label)
+                if isinstance(arr, list):
+                    for v in arr:
+                        _push_one(v)
+
+            # パターン1b: {"label_to_views": { label: {view: {"rep": [...], "mean": [...], ...}, ... } } }
+            if "label_to_views" in data and isinstance(data["label_to_views"], dict):
+                view_map = data["label_to_views"].get(label)
+                if isinstance(view_map, dict):
+                    for _view, vinfo in view_map.items():
+                        if not isinstance(vinfo, dict):
+                            continue
+                        # 単体ベクトル
+                        for key in ("rep", "mean", "vec", "centroid"):
+                            if key in vinfo:
+                                _push_one(vinfo[key])
+                        # 複数ベクトル
+                        for key in ("vecs", "features", "embs"):
+                            arr = vinfo.get(key)
+                            if isinstance(arr, list):
+                                for v in arr:
+                                    _push_one(v)
+
+            # パターン1c: {"label_to_sources": { label: {src: {...}}, ... }} （外見fused想定）
+            if "label_to_sources" in data and isinstance(data["label_to_sources"], dict):
+                src_map = data["label_to_sources"].get(label)
+                if isinstance(src_map, dict):
+                    for _src, sinfo in src_map.items():
+                        if not isinstance(sinfo, dict):
+                            continue
+                        for key in ("rep", "mean", "vec", "centroid"):
+                            if key in sinfo:
+                                _push_one(sinfo[key])
+                        for key in ("vecs", "features", "embs"):
+                            arr = sinfo.get(key)
+                            if isinstance(arr, list):
+                                for v in arr:
+                                    _push_one(v)
+
+            # パターン2: {"records":[{pid/label/name/id,..., vec/feature/...}, ...]}
+            if isinstance(data.get("records"), list):
+                for rec in data["records"]:
+                    if not isinstance(rec, dict):
+                        continue
+                    pid = str(
+                        rec.get("pid")
+                        or rec.get("label")
+                        or rec.get("name")
+                        or rec.get("id")
+                        or ""
+                    ).strip()
+                    if pid != label:
+                        continue
+                    if "vec" in rec:
+                        _push_one(rec["vec"])
+                    for key in ("feature", "emb", "centroid"):
+                        if key in rec:
+                            _push_one(rec[key])
+                    for key in ("vecs", "features", "embs"):
+                        arr = rec.get(key)
+                        if isinstance(arr, list):
+                            for v in arr:
+                                _push_one(v)
+
+            # パターン3: その他（dictでキー=label の場合など）
+            if not vecs and label in data:
+                _push_one(data[label])
+
+        # --- list 形式: [{"pid":...,"vec":...}, ...] など ---
         elif isinstance(data, list):
             for rec in data:
-                if isinstance(rec, dict):
-                    pid = str(rec.get("pid") or rec.get("label") or rec.get("name") or rec.get("id") or "").strip()
-                    if pid == label and "vec" in rec:
-                        a = np.asarray(rec["vec"], dtype=np.float32)
-                        if a.ndim == 1:
-                            vecs.append(a)
-                        elif a.ndim == 2:
-                            vecs.extend([np.asarray(r, dtype=np.float32) for r in a])
-        # パターン3: その他（dictでキー=pid の場合など）
-        elif isinstance(data, dict):
-            if label in data:
-                a = np.asarray(data[label], dtype=np.float32)
-                if a.ndim == 1:
-                    vecs.append(a)
-                elif a.ndim == 2:
-                    vecs.extend([np.asarray(r, dtype=np.float32) for r in a])
+                if not isinstance(rec, dict):
+                    continue
+                pid = str(
+                    rec.get("pid")
+                    or rec.get("label")
+                    or rec.get("name")
+                    or rec.get("id")
+                    or ""
+                ).strip()
+                if pid != label:
+                    continue
+                if "vec" in rec:
+                    _push_one(rec["vec"])
+                for key in ("feature", "emb", "centroid"):
+                    if key in rec:
+                        _push_one(rec[key])
+                for key in ("vecs", "features", "embs"):
+                    arr = rec.get(key)
+                    if isinstance(arr, list):
+                        for v in arr:
+                            _push_one(v)
 
+        # 何も拾えなかったら None
         if not vecs:
             return None
-        # L2正規化前提のコサイン類似なので、ここで一応正規化
+
+        # L2正規化前提のコサイン類似なので、ここで正規化して返す
         vs = np.stack(vecs, axis=0)
         n = np.linalg.norm(vs, axis=1, keepdims=True) + 1e-12
         return vs / n
@@ -2494,35 +2949,47 @@ class AutoController(QObject):
         """
         Face + Pose の検出結果を ByteTracker に渡し、
         返ってきた Track 一覧から Pose / Face それぞれに track_id を割り当てる。
+        すでに Pose↔Face の紐づき情報(_pose_face_index) がある場合は、
+        Pose 側の track_id を正として Face 側の track_id を揃える。
         """
         # 検出が何もなければ TrackID はリセット
         if (self._boxes_pose is None or len(self._boxes_pose) == 0) and \
-           (self._boxes_face is None or len(self._boxes_face) == 0):
+        (self._boxes_face is None or len(self._boxes_face) == 0):
             self._track_ids_pose = None
             self._track_ids_face = None
+            self._active_track_ids = set()
             return
 
         dets_list = []
 
         # Pose の検出を (N,5) [x1,y1,x2,y2,score] 形式に
-        if self._boxes_pose is not None and self._scores_pose is not None and len(self._boxes_pose) > 0:
+        if (
+            self._boxes_pose is not None
+            and self._scores_pose is not None
+            and len(self._boxes_pose) > 0
+        ):
             dets_pose = np.concatenate(
                 [self._boxes_pose, self._scores_pose.reshape(-1, 1)],
-                axis=1
+                axis=1,
             )
             dets_list.append(dets_pose)
 
         # Face の検出を (M,5) で追加
-        if self._boxes_face is not None and self._scores_face is not None and len(self._boxes_face) > 0:
+        if (
+            self._boxes_face is not None
+            and self._scores_face is not None
+            and len(self._boxes_face) > 0
+        ):
             dets_face = np.concatenate(
                 [self._boxes_face, self._scores_face.reshape(-1, 1)],
-                axis=1
+                axis=1,
             )
             dets_list.append(dets_face)
 
         if not dets_list:
             self._track_ids_pose = None
             self._track_ids_face = None
+            self._active_track_ids = set()
             return
 
         dets = np.vstack(dets_list).astype(np.float32)  # (K,5)
@@ -2548,9 +3015,20 @@ class AutoController(QObject):
         # 今フレーム時点での「アクティブな TrackID」を保存
         self._active_track_ids = {t.track_id for t in tracks}
 
-        # Track → Pose / Face それぞれに ID を振り分け
+        # Track → Pose / Face それぞれに ID を振り分け（従来通り）
         self._track_ids_pose = self._assign_track_ids(self._boxes_pose, tracks)
         self._track_ids_face = self._assign_track_ids(self._boxes_face, tracks)
+
+        # --- ここから追記部分 ----------------------------------------
+        # すでに Pose↔Face 紐づきが計算済みなら、t-id を揃える
+        try:
+            if getattr(self, "_pose_face_index", None) is not None:
+                self._unify_track_ids_pose_face()
+        except Exception as e:
+            # ここで失敗しても元の挙動は維持されるようにしておく
+            self.log.exception("[AUTO] unify_track_ids_pose_face failed: %s", e)
+        # -------------------------------------------------------------
+
 
     def _assign_track_ids(self, boxes: Optional[np.ndarray], tracks: List[Track]) -> Optional[np.ndarray]:
         """
@@ -2858,7 +3336,7 @@ class AutoController(QObject):
             img_path = os.path.join(self._auto_report_session_dir, fname)
             cv2.imwrite(img_path, crop)
 
-            # ★ ent.face_sim / app_sim / gait_sim は
+            #  ent.face_sim / app_sim / gait_sim は
             #   いま渡した「平均類似度」に対応する
             snapshots_for_frame.append(
                 {
@@ -2912,7 +3390,7 @@ class AutoController(QObject):
             self.log.info(
                 "[AUTO][REPORT] builder=None のためレポート生成はスキップします（既に確定済みの可能性）。"
             )
-            # ★ cleanup は下の finally で必ず実行されるので、ここでは return だけ
+            #  cleanup は下の finally で必ず実行されるので、ここでは return だけ
             return
 
         # ② スナップショットが本当に 0 件の場合だけこのメッセージを出す
@@ -2967,13 +3445,13 @@ class AutoController(QObject):
             self._auto_report_session_dir = None
             self._auto_report_frame_counter = 0
 
-            # ★ ランキング用の類似度統計をリセット
+            #  ランキング用の類似度統計をリセット
             self._track_stats_face.clear()
             self._track_stats_app.clear()
             self._track_stats_gait.clear()
             self._frame_counter = 0
 
-            # ★ 歩容識別・学習用の32フレームバッファもリセット
+            #  歩容識別・学習用の32フレームバッファもリセット
             try:
                 self._gseq_buffer.clear()
             except Exception:
@@ -3165,7 +3643,7 @@ class AutoController(QObject):
         self._buf_face.append(v)
 
         if cnt >= need_frames:
-            # ★ AUTO_FACE_FRAMES 枚そろったので、この向きは「最終版」として確定
+            #  AUTO_FACE_FRAMES 枚そろったので、この向きは「最終版」として確定
             self._face_pose_finalized.add(pose_type)
             self.log.info(
                 "[AUTO][LEARN][face] pose=%s collected (final: %d frames, now %d types).",
@@ -3175,18 +3653,53 @@ class AutoController(QObject):
             self._face_pose_run_type = None
             self._face_pose_run_vecs = []
         else:
-            # ★ 暫定版のログ（何枚目か分かるように）
+            #  暫定版のログ（何枚目か分かるように）
             self.log.info(
                 "[AUTO][LEARN][face] pose=%s collected (temp: %d/%d frames, now %d types).",
                 pose_type, cnt, need_frames, len(self._buf_face_by_pose),
             )
+            
+    @staticmethod
+    def _select_best_vec(cands: np.ndarray,
+                         q_vec: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """
+        cands: (D,) または (K,D)
+        q_vec: クエリベクトル (D,)
+
+        - q_vec があれば cos 類似度が最大の1本を返す
+        - q_vec が無ければ:
+            * (D,) のときはそのまま
+            * (K,D) のときは単純平均（既存挙動に近い安全策）
+        """
+        if cands is None:
+            return None
+        v = np.asarray(cands, np.float32)
+        if v.ndim == 1:
+            return v
+
+        if q_vec is None:
+            # 平均ベクトル（既存実装との整合優先）
+            m = v.mean(axis=0)
+            n = float(np.linalg.norm(m) + 1e-12)
+            return (m / n).astype(np.float32)
+
+        q = np.asarray(q_vec, np.float32).reshape(-1)
+        q /= (np.linalg.norm(q) + 1e-12)
+
+        sims = v @ q  # (K,)
+        idx = int(np.nanargmax(sims))
+        chosen = v[idx]
+        n = float(np.linalg.norm(chosen) + 1e-12)
+        return (chosen / n).astype(np.float32)
 
     def _pick_gallery_vec_for_pose(self, need_pose: Optional[str],
                                    pose_map: Dict[str, np.ndarray],
-                                   default_vec: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                                   default_vec: Optional[np.ndarray],
+                                   q_vec: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """
-        need_poseに最も近い向きのギャラリー特徴を返す。
-        フォールバック規則（ご指定どおり）を実装。
+        need_pose に最も近い向きのギャラリー特徴を返す。
+        pose_map[pose] は (D,) または (K,D) を許容する。
+        K>1 の場合、q_vec との類似度が最大の1本を選ぶ。
         """
         if pose_map is None or len(pose_map) == 0:
             return default_vec
@@ -3196,13 +3709,13 @@ class AutoController(QObject):
         # 便宜上の正規化
         p = (need_pose or "").strip().lower()
 
-        # 候補順序マップ
+        # 候補順序マップ（既存ロジックそのまま）
         order: Dict[str, list] = {
             "right": [
                 "right",
                 "front",
                 "left",
-                "right-look-down",   # look-down の同じ向き
+                "right-look-down",
                 "look-down",
                 "left-look-down",
             ],
@@ -3210,21 +3723,21 @@ class AutoController(QObject):
                 "left",
                 "front",
                 "right",
-                "left-look-down",    # look-down の同じ向き
+                "left-look-down",
                 "look-down",
                 "right-look-down",
             ],
             "right-look-down": [
                 "right-look-down",
-                "left-look-down",    # look-down の別の向き
                 "look-down",
-                "front",
+                "left-look-down",
                 "right",
+                "front",
                 "left",
             ],
             "left-look-down": [
                 "left-look-down",
-                "right-look-down",   # look-down の別の向き
+                "right-look-down",
                 "look-down",
                 "front",
                 "left",
@@ -3251,44 +3764,39 @@ class AutoController(QObject):
         candidates = order.get(p, ["front", "right", "left", "look-down", "right-look-down", "left-look-down"])
         for c in candidates:
             if has(c):
-                return pose_map[c]
+                return self._select_best_vec(pose_map[c], q_vec)
 
         return default_vec
     
     def _pick_gallery_vec_for_view(self,
                                    need_view: Optional[str],
                                    view_map: Dict[str, np.ndarray],
-                                   default_vec: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                                   default_vec: Optional[np.ndarray],
+                                   q_vec: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """
         歩容の向き（front/back/side）に応じて、
         ギャラリーから一番優先度の高い view のベクトルを返す。
 
-        優先ルール:
-          - 正面の場合: front > back > side
-          - 背面の場合: back  > front > side
-          - 側面の場合: side  > front > back
+        view_map[view] は (D,) または (K,D) を許容し、
+        K>1 の場合には q_vec との類似度が最大の1本を返す。
         """
-        if not view_map:
+        if view_map is None or len(view_map) == 0:
             return default_vec
+
+        def has(v): return (v in view_map)
 
         v = (need_view or "").strip().lower()
 
-        def has(k: str) -> bool:
-            return (k in view_map and view_map[k] is not None)
+        order: Dict[str, list] = {
+            "front": ["front", "side", "back"],
+            "back":  ["back", "side", "front"],
+            "side":  ["side", "front", "back"],
+        }
 
-        if v == "front":
-            order = ["front", "back", "side"]
-        elif v == "back":
-            order = ["back", "front", "side"]
-        elif v == "side":
-            order = ["side", "front", "back"]
-        else:
-            # 不明な場合は front 優先
-            order = ["front", "back", "side"]
-
-        for k in order:
-            if has(k):
-                return view_map[k]
+        candidates = order.get(v, ["front", "side", "back"])
+        for c in candidates:
+            if has(c):
+                return self._select_best_vec(view_map[c], q_vec)
 
         return default_vec
     
@@ -3297,6 +3805,7 @@ class AutoController(QObject):
         need_dir8: Optional[str],
         dir8_map: Dict[str, np.ndarray],
         default_vec: Optional[np.ndarray],
+        q_vec: Optional[np.ndarray] = None,
     ) -> Optional[np.ndarray]:
         """
         歩容の8方向(dir8)に応じて、ギャラリーから使うベクトルを選ぶ。
@@ -3306,20 +3815,31 @@ class AutoController(QObject):
           2. なければ「need_dir8ごとの優先順」に従って他のdir8を探す
           3. それでも無ければ default_vec（非dir8ギャラリー）にフォールバック
 
-        ※ 全方位平均（全dir8の平均）は出さない。
+        dir8_map[dir8] には (D,) または (K,D) を許容する。
+        K>1 の場合は q_vec（クエリ埋め込み）との cos 類似度が最大の1本を選ぶ。
+        全方位平均（全dir8の平均）は出さない。
         """
 
         if not dir8_map:
             # dir8 付きギャラリーがそもそも無い → 旧形式のギャラリーへ
             return default_vec
 
-        # キーを小文字に揃えておく
+        # キーを小文字に揃えつつ、ベクトルを正規化して保持
         norm_map: Dict[str, np.ndarray] = {}
         for k, v in dir8_map.items():
             if v is None:
                 continue
             k_norm = str(k).strip().lower()
-            norm_map[k_norm] = np.asarray(v, np.float32).reshape(-1)
+            arr = np.asarray(v, np.float32)
+            if arr.ndim == 1:
+                # (D,) → そのまま1本
+                n = float(np.linalg.norm(arr) + 1e-12)
+                norm_map[k_norm] = (arr / n).astype(np.float32)
+            elif arr.ndim >= 2:
+                # (K,D) を想定。最後の軸で正規化
+                arr = arr.reshape(arr.shape[0], -1)
+                n = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+                norm_map[k_norm] = (arr / n).astype(np.float32)
 
         if not norm_map:
             return default_vec
@@ -3328,7 +3848,7 @@ class AutoController(QObject):
 
         # まずは完全一致
         if need and need in norm_map:
-            return norm_map[need]
+            return self._select_best_vec(norm_map[need], q_vec)
 
         # ---- need_dir8 ごとのフォールバック優先順 ----
         # ラベル対応:
@@ -3438,10 +3958,11 @@ class AutoController(QObject):
         # 指定された優先順で「次善の向き」を探す
         for alt in fallback_rules[need]:
             if alt in norm_map:
-                return norm_map[alt]
+                return self._select_best_vec(norm_map[alt], q_vec)
 
         # ここまで来たら、そのラベルについては dir8 ギャラリーなし → 非dir8にフォールバック
         return default_vec
+
     
     def _pose_for_face_index(self, idx_face: int) -> Optional[str]:
         """
@@ -4037,3 +4558,217 @@ class AutoController(QObject):
             out[d8] = (vv / n).astype(np.float32)
 
         return out
+
+    def _compute_head_box(self, kpts_one: np.ndarray) -> Optional[np.ndarray]:
+        """
+        1人分の keypoints (17,3) から、
+        「片側の耳＋同じ側の目」の2点だけを使って“小さい頭BBOX”を作る。
+
+        - 左目＋左耳ペア
+        - 右目＋右耳ペア
+
+        のうち、条件を満たすペアを 1 つだけ選ぶ。
+        戻り値: [x1, y1, x2, y2] or None
+        """
+
+        def _pair_box(eye_idx: int, ear_idx: int, kpts: np.ndarray, conf_th: float = 0.2):
+            # 2点がそろっていて、どちらも conf >= conf_th なら、その2点のBBOXと信頼度合計を返す
+            ex, ey, econf = kpts[eye_idx]
+            ax, ay, aconf = kpts[ear_idx]
+
+            if econf < conf_th or aconf < conf_th:
+                return None, None
+
+            x1 = float(min(ex, ax))
+            x2 = float(max(ex, ax))
+            y1 = float(min(ey, ay))
+            y2 = float(max(ey, ay))
+
+            # そのままだとピッタリすぎるので、少しマージンを足す
+            margin = 0.3
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+            w = (x2 - x1) * (1.0 + margin)
+            h = (y2 - y1) * (1.0 + margin)
+
+            box = np.array(
+                [cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5],
+                dtype=np.float32,
+            )
+            score = float(econf + aconf)  # 片側ペアの「信頼度の合計」として使う
+            return box, score
+
+        # 左側ペア（左目＋左耳）
+        left_box, left_score = _pair_box(
+            COCO_IDX_LEFT_EYE, COCO_IDX_LEFT_EAR, kpts_one
+        )
+
+        # 右側ペア（右目＋右耳）
+        right_box, right_score = _pair_box(
+            COCO_IDX_RIGHT_EYE, COCO_IDX_RIGHT_EAR, kpts_one
+        )
+
+        # どちらもダメなら None（このあと従来ロジックにフォールバックする想定）
+        if left_box is None and right_box is None:
+            return None
+
+        # 片方だけ有効ならそちらを採用
+        if left_box is not None and right_box is None:
+            return left_box
+
+        if right_box is not None and left_box is None:
+            return right_box
+
+        # 両方有効なら、スコアが高い方（＝confが高い側）を採用
+        if left_score >= right_score:
+            return left_box
+        else:
+            return right_box
+        
+    def _unify_track_ids_pose_face(self) -> None:
+        """
+        Pose と Face の t-id を一致させる後処理。
+
+        前提:
+        - self._track_ids_pose: 各 Pose BBOX に対応する track_id (or -1)
+        - self._track_ids_face: 各 Face BBOX に対応する track_id (or -1)
+        - self._pose_face_index: 各 Pose がどの Face と紐づいているか (or None)
+
+        挙動:
+        - pose_tid を正として、対応する face の track_id を pose_tid に上書きする。
+        - どれかが欠けていれば何もしない。
+        """
+        if (
+            self._track_ids_pose is None
+            or self._track_ids_face is None
+            or self._pose_face_index is None
+        ):
+            return
+
+        # 念のため長さチェック（互換性維持用）
+        n_pose = len(self._track_ids_pose)
+        n_face = len(self._track_ids_face)
+
+        for pi, fi in enumerate(self._pose_face_index):
+            if fi is None:
+                continue
+
+            # index 範囲チェック
+            if not (0 <= pi < n_pose and 0 <= fi < n_face):
+                continue
+
+            pose_tid = int(self._track_ids_pose[pi])
+            if pose_tid < 0:
+                # Pose に有効なトラックIDがない場合はスキップ
+                continue
+
+            # ここで「顔側の t-id を Pose 側の t-id で上書き」する
+            self._track_ids_face[fi] = pose_tid
+            
+    def _update_similarity_plots_for_frame(self) -> None:
+        """
+        顔 / 外見 / 歩容の類似度を TrackID ごとにまとめて AutoPlotManager に渡す。
+        - ロジックは _update_similarity_track_stats() と整合が取れるようにしている
+        """
+        pm = getattr(self, "_plot_mgr", None)
+        if pm is None or not getattr(pm, "enabled", False):
+            return
+        if not self.id_on:
+            return
+
+        active_tids = getattr(self, "_active_track_ids", None)
+        if not active_tids:
+            return
+
+        track_ids_pose = getattr(self, "_track_ids_pose", None)
+        if track_ids_pose is None:
+            return
+
+        # ★ numpy 配列対応：要素数で判定する
+        try:
+            import numpy as np
+            if isinstance(track_ids_pose, np.ndarray):
+                if track_ids_pose.size == 0:
+                    return
+            else:
+                if len(track_ids_pose) == 0:
+                    return
+        except Exception:
+            # 万一 np が無くても len() でフォールバック
+            try:
+                if len(track_ids_pose) == 0:
+                    return
+            except Exception:
+                return
+
+        # 類似度配列（既に計算済みのもの）
+        sim_face = getattr(self, "_sim_face", None)
+        sim_app  = getattr(self, "_sim_app",  None)
+        sim_gait = getattr(self, "_sim_gait", None)
+        pose_face_index = getattr(self, "_pose_face_index", None)
+
+        face_scores: dict[int, float] = {}
+        app_scores:  dict[int, float] = {}
+        gait_scores: dict[int, float] = {}
+
+        # Poseインデックス i ごとに、Pose側の TrackID をキーにして集約
+        for i, tid in enumerate(track_ids_pose):
+            if tid is None:
+                continue
+
+            try:
+                tid_int = int(tid)
+            except Exception:
+                tid_int = tid
+
+            if tid_int not in active_tids:
+                continue
+
+            # ---- Face: Poseインデックス -> Faceインデックス -> 類似度 ----
+            if sim_face is not None and pose_face_index is not None and i < len(pose_face_index):
+                fi = pose_face_index[i]
+                if fi is not None and 0 <= fi < len(sim_face):
+                    try:
+                        s = float(sim_face[fi])
+                        if not np.isnan(s):
+                            prev = face_scores.get(tid_int)
+                            if prev is None or s > prev:
+                                face_scores[tid_int] = s
+                    except Exception:
+                        pass
+
+            # ---- Appearance: Poseインデックス i そのものを使う ----
+            if sim_app is not None and i < len(sim_app):
+                try:
+                    s = float(sim_app[i])
+                    if not np.isnan(s):
+                        prev = app_scores.get(tid_int)
+                        if prev is None or s > prev:
+                            app_scores[tid_int] = s
+                except Exception:
+                    pass
+
+            # ---- Gait: Poseインデックス i そのものを使う ----
+            if sim_gait is not None and i < len(sim_gait):
+                try:
+                    s = float(sim_gait[i])
+                    if not np.isnan(s):
+                        prev = gait_scores.get(tid_int)
+                        if prev is None or s > prev:
+                            gait_scores[tid_int] = s
+                except Exception:
+                    pass
+
+        frame_idx = getattr(self, "_capture_frame_idx", 0)
+        if frame_idx <= 0:
+            return
+
+        try:
+            pm.update(
+                frame_idx=frame_idx,
+                face_scores_by_tid=face_scores,
+                app_scores_by_tid=app_scores,
+                gait_scores_by_tid=gait_scores,
+            )
+        except Exception as e:
+            self.log.exception("[AUTO][PLOT] pm.update failed: %s", e)

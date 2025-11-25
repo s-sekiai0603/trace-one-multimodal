@@ -20,6 +20,7 @@ import cv2
 
 from .. import config
 from ..db.feature import save_face_features
+from ..db.feat_fuse import fuse_face_auto, fuse_app_auto, fuse_gait_auto, fuse_all_auto
 from ..utils.preprocess_video import VideoPreprocessor
 from .ada_face_controller import AdaFaceController
 from .osnet_controller import OsnetController
@@ -168,6 +169,10 @@ class AppController:
 
         # 特徴バッファのクリア要求
         self.ui.featureBufferClearRequested.connect(self.on_feature_buffer_clear)
+        
+        # 特徴統合要求
+        if hasattr(self.ui, "featureFuseRequested"):
+            self.ui.featureFuseRequested.connect(self.on_feature_fuse_requested)
 
         # アプリ終了
         self.ui.appClosing.connect(self.on_app_closing)
@@ -406,6 +411,76 @@ class AppController:
         """
         if getattr(self, "auto", None) and hasattr(self.auto, "set_html_thresholds"):
             self.auto.set_html_thresholds(face, app, gait)
+            
+    def on_feature_fuse_requested(
+        self,
+        mode_key: str,
+        label_a: str,
+        label_b: str,
+        base_label: str,
+    ):
+        """
+        PlayerWindow からの「特徴統合」リクエストを受けて、
+        db.feat_fuse のユーティリティを呼び出す。
+        
+        mode_key: "face" / "appearance" / "gait" / "all"
+        label_a, label_b: 統合対象ラベル
+        base_label: 新ラベルのベース名（例: "Sasakura-fused"）
+        """
+        try:
+            # ラベルをユニーク化して2本以上あることを確認
+            src_labels = [s for s in {label_a, label_b} if s]
+            if len(src_labels) < 2:
+                log.warning("[FEAT-FUSE] invalid src_labels: %s", src_labels)
+                return
+
+            base_label = (base_label or "").strip()
+            if not base_label:
+                log.warning("[FEAT-FUSE] empty base_label; skip.")
+                return
+
+            m = (mode_key or "").strip().lower()
+            if m == "face":
+                path, fused_label = fuse_face_auto(src_labels, base_label)
+                log.info(
+                    "[FEAT-FUSE][FACE] fused %s -> %s (path=%s)",
+                    src_labels, fused_label, path,
+                )
+
+            elif m == "appearance":
+                path, fused_label = fuse_app_auto(src_labels, base_label)
+                log.info(
+                    "[FEAT-FUSE][APP] fused %s -> %s (path=%s)",
+                    src_labels, fused_label, path,
+                )
+
+            elif m == "gait":
+                path, fused_label = fuse_gait_auto(src_labels, base_label)
+                log.info(
+                    "[FEAT-FUSE][GAIT] fused %s -> %s (path=%s)",
+                    src_labels, fused_label, path,
+                )
+
+            elif m == "all":
+                result = fuse_all_auto(src_labels, base_label)
+                log.info(
+                    "[FEAT-FUSE][ALL] fused %s -> %s (face=%s, app=%s, gait=%s)",
+                    src_labels,
+                    result.get("label"),
+                    result.get("face_path"),
+                    result.get("app_path"),
+                    result.get("gait_path"),
+                )
+
+            else:
+                log.warning("[FEAT-FUSE] unknown mode_key=%s", mode_key)
+                return
+
+            # ★ 将来的に:
+            # AutoController側に「ギャラリー再読込」などのフックを用意したら、
+            # ここで self.auto.reload_galleries() 的な呼び出しを入れるとさらに親切。
+        except Exception as e:
+            log.exception("[FEAT-FUSE] failed: %s", e)
         
     def on_identification_config_selected(self, gallery_json_path: str, target_pid: str):
         mode = (self.mode_text or "").strip()

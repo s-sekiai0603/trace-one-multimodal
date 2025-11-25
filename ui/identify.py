@@ -130,10 +130,24 @@ def _load_pids_from_json(json_path: str) -> List[str]:
         return []
 
 def _collect_auto_labels() -> list[str]:
-    labels = set()
+    """
+    Autoモードのギャラリーから「名前+連番」ラベルを収集してソートして返す。
 
-    def _scan(path: str):
-        if not os.path.isfile(path):
+    対象:
+        - AUTO_FACE_JSON / AUTO_APP_JSON / AUTO_GAIT_JSON
+        - 同じフォルダ内の face_fused_gallery.json / app_fused_gallery.json / gait_fused_gallery.json
+
+    対応フォーマット:
+        - list[dict] 形式（face_auto など）
+        - dict["label_to_vecs"] 形式（appearance / gait の従来形式）
+        - dict["label_to_views"] 形式（歩容 dir8/fused）
+        - dict["label_to_sources"] 形式（外見 fused）
+        - dict["records"] 内に pid/label/name/id を持つ形式
+    """
+    labels: set[str] = set()
+
+    def _scan(path: str) -> None:
+        if not path or not os.path.isfile(path):
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -141,38 +155,76 @@ def _collect_auto_labels() -> list[str]:
         except Exception:
             return
 
+        # --- 各種JSONフォーマットに耐性を持たせる ---
         if isinstance(data, list):
             it = data
         elif isinstance(data, dict):
-            if "label_to_vecs" in data and isinstance(data["label_to_vecs"], dict):
-                it = [{"pid": k} for k in data["label_to_vecs"].keys()]
+            # 1) records 配列を持つタイプ {"records":[{pid/label/...}, ...]}
+            if "records" in data and isinstance(data["records"], list):
+                it = data["records"]
             else:
-                it = [{"pid": k} for k in data.keys()]
+                # 2) マップ形式:
+                #    - {"label_to_vecs": {...}}
+                #    - {"label_to_views": {...}}   # gait_fused_gallery
+                #    - {"label_to_sources": {...}}# app_fused_gallery
+                #    - それ以外は top-level のキー群
+                if "label_to_vecs" in data and isinstance(data["label_to_vecs"], dict):
+                    keys = data["label_to_vecs"].keys()
+                elif "label_to_views" in data and isinstance(data["label_to_views"], dict):
+                    keys = data["label_to_views"].keys()
+                elif "label_to_sources" in data and isinstance(data["label_to_sources"], dict):
+                    keys = data["label_to_sources"].keys()
+                else:
+                    keys = data.keys()
+                it = [{"pid": k} for k in keys]
         else:
             it = []
 
+        # --- 共通: it からラベル文字列を抽出 ---
         for rec in it:
             val = None
             if isinstance(rec, dict):
+                # よく使われるキー順に拾う
                 for key in ("pid", "label", "name", "id"):
                     if key in rec:
-                        val = str(rec[key]); break
+                        val = str(rec[key])
+                        break
+                # dict のキーそのものが PID になっている場合も拾う
                 if val is None and len(rec) == 1:
                     val = str(next(iter(rec.keys())))
             elif isinstance(rec, str):
                 val = rec
+
             if not val:
                 continue
+
             s = val.strip()
-            # “名前-連番”だけ採用（例: Mizuta-P0001 / Aoki-0003 など）
+            # “名前-連番”だけ採用（例: Mizuta-P0001 / Aoki-0003 / Mizuta-back-fused-P0001 など）
             if re.search(r"-[A-Za-z]?(\d{2,})$", s):
                 labels.add(s)
 
+    # --- ベース: 従来の3ファイル ---
     for p in (AUTO_FACE_JSON, AUTO_APP_JSON, AUTO_GAIT_JSON):
         _scan(p)
 
+    # --- 追加: 同じフォルダ内の fused ギャラリーも見る ---
+    try:
+        base_dir = os.path.dirname(AUTO_FACE_JSON) or os.path.dirname(AUTO_APP_JSON) or os.path.dirname(AUTO_GAIT_JSON)
+    except Exception:
+        base_dir = ""
+
+    if base_dir:
+        fused_files = (
+            os.path.join(base_dir, "face_fused_gallery.json"),
+            os.path.join(base_dir, "app_fused_gallery.json"),
+            os.path.join(base_dir, "gait_fused_gallery.json"),
+        )
+        for p in fused_files:
+            _scan(p)
+
     # ベース名→ラベルで安定ソート
     return sorted(labels, key=lambda x: (x.split("-")[0].lower(), x))
+
 
 class IdentifyDialog(QDialog):
     def __init__(self,

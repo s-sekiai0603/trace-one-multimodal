@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from .identify import IdentifyDialog
+from .feat_fuse_dialog import FeatFuseDialog
 from ..config import VIDEO_ORIENTATION, AUTO_FACE_THRESH_DEFAULT, AUTO_APP_THRESH_DEFAULT, AUTO_GAIT_THRESH_DEFAULT
 
 # --- 設定（DEFAULT_VIDEO_PATH が無い環境でも動くようフォールバック） ---
@@ -135,6 +136,7 @@ class PlayerWindow(QMainWindow):
     featureLearningToggled = Signal(bool)
     identificationToggled = Signal(bool)
     identificationConfigSelected = Signal(str, str)
+    featureFuseRequested = Signal(str, str, str, str)  # mode_key, label_a, label_b, base_label
 
     # その他
     frameAvailable = Signal(object)  # BGR フレーム
@@ -215,6 +217,10 @@ class PlayerWindow(QMainWindow):
         self.btn_clear_feat.clicked.connect(self._on_clear_feat_clicked)
         self.btn_clear_feat.setEnabled(False)
         
+        # 特徴統合ダイアログ起動ボタン
+        self.btn_feat_fuse = QPushButton("特徴統合", self)
+        self.btn_feat_fuse.clicked.connect(self._on_feat_fuse_clicked)
+        
         self._update_enable_states()
         
         # --- マルチモーダルモード用 閾値テキストボックス（顔/外見/歩容） ---
@@ -277,6 +283,7 @@ class PlayerWindow(QMainWindow):
         
         bar.addSpacing(16)
         bar.addWidget(self.btn_clear_feat)
+        bar.addWidget(self.btn_feat_fuse)
         bar.addStretch(1)
         bar.addWidget(self.lbl_time)
         v.addLayout(bar)
@@ -406,6 +413,25 @@ class PlayerWindow(QMainWindow):
             self.featureBufferClearRequested.emit()
         except Exception:
             pass
+        
+    def _on_feat_fuse_clicked(self):
+        """特徴統合ダイアログを開き、ユーザーの選択内容を通知する。"""
+        try:
+            dlg = FeatFuseDialog(self)
+            if dlg.exec() == QDialog.Accepted:
+                mode_key = dlg.selected_mode_key()
+                label_a, label_b = dlg.selected_labels()
+                base_label = dlg.new_label_base()
+                log.info(
+                    "[FEAT-FUSE] mode=%s, A=%s, B=%s, base=%s",
+                    mode_key, label_a, label_b, base_label,
+                )
+                try:
+                    self.featureFuseRequested.emit(mode_key, label_a, label_b, base_label)
+                except Exception:
+                    log.exception("featureFuseRequested.emit failed")
+        except Exception:
+            log.exception("FeatFuseDialog failed")
 
     def _on_id_toggle_clicked(self, on: bool):
         self._id_on = bool(on)

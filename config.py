@@ -23,7 +23,7 @@ FPS = 30
 
 # 動画前処理
 PREPROCESS = {
-    "ENABLE": False,  # ★ 全体ON/OFF
+    "ENABLE": False,  #  全体ON/OFF
     "ORDER": ["BRICON", "GAMMA", "HIST_EQ", "DENOISE", "SHARPEN", "SUPERRES"],
 
     "BRICON": {      # 明るさ/コントラスト
@@ -344,3 +344,9 @@ AUTO_GAIT_JSON     = os.path.join(AUTO_GALLERY_DIR, "gait_gallery.json")
 AUTO_SERIAL_PREFIX = "P"
 AUTO_SERIAL_WIDTH  = 4
 
+# COCO 17 keypoints index
+COCO_IDX_NOSE      = 0
+COCO_IDX_LEFT_EYE  = 1
+COCO_IDX_RIGHT_EYE = 2
+COCO_IDX_LEFT_EAR  = 3
+COCO_IDX_RIGHT_EAR = 4
